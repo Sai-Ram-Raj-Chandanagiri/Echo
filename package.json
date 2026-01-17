@@ -1,0 +1,260 @@
+{
+  "name": "codecollab",
+  "displayName": "CodeCollab - Real-Time Collaboration",
+  "description": "Real-time collaborative coding with video, voice comments, and AI assistance",
+  "version": "0.1.0",
+  "publisher": "codecollab",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/codecollab/codecollab-extension"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Education"
+  ],
+  "keywords": [
+    "collaboration",
+    "live share",
+    "pair programming",
+    "webrtc",
+    "AI assistant",
+    "real-time",
+    "voice comments"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codecollab.startSession",
+        "title": "CodeCollab: Start Collaboration Session",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "codecollab.joinSession",
+        "title": "CodeCollab: Join Collaboration Session",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "codecollab.leaveSession",
+        "title": "CodeCollab: Leave Session",
+        "icon": "$(close)"
+      },
+      {
+        "command": "codecollab.followUser",
+        "title": "CodeCollab: Follow Collaborator",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "codecollab.unfollowUser",
+        "title": "CodeCollab: Stop Following",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "codecollab.recordVoiceComment",
+        "title": "CodeCollab: Record Voice Comment",
+        "icon": "$(mic)"
+      },
+      {
+        "command": "codecollab.toggleVideo",
+        "title": "CodeCollab: Toggle Video",
+        "icon": "$(device-camera-video)"
+      },
+      {
+        "command": "codecollab.toggleAudio",
+        "title": "CodeCollab: Toggle Audio",
+        "icon": "$(unmute)"
+      },
+      {
+        "command": "codecollab.openAI",
+        "title": "CodeCollab: Open AI Assistant",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "codecollab.shareTerminal",
+        "title": "CodeCollab: Share Terminal",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "codecollab.copySessionId",
+        "title": "CodeCollab: Copy Session ID",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "codecollab.playVoiceCommentOnLine",
+        "title": "Play Voice Comment",
+        "icon": "$(play)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codecollab-sidebar",
+          "title": "CodeCollab",
+          "icon": "media/icons/codecollab.svg"
+        }
+      ]
+    },
+    "views": {
+      "codecollab-sidebar": [
+        {
+          "type": "webview",
+          "id": "codecollab.mainView",
+          "name": "Collaboration"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CodeCollab",
+      "properties": {
+        "codecollab.signalingServer": {
+          "type": "string",
+          "default": "ws://localhost:3001",
+          "description": "WebSocket signaling server URL"
+        },
+        "codecollab.ollamaUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Ollama API URL for AI features"
+        },
+        "codecollab.defaultModel": {
+          "type": "string",
+          "default": "codellama:7b",
+          "enum": [
+            "codellama:7b",
+            "codellama:13b",
+            "deepseek-coder:6.7b",
+            "mistral:7b",
+            "llama2:7b"
+          ],
+          "description": "Default Ollama model for AI assistance"
+        },
+        "codecollab.enableVideo": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable video communication by default"
+        },
+        "codecollab.enableAudio": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable audio communication by default"
+        },
+        "codecollab.userName": {
+          "type": "string",
+          "default": "",
+          "description": "Your display name in collaboration sessions"
+        },
+        "codecollab.cursorStyle": {
+          "type": "string",
+          "default": "line",
+          "enum": [
+            "line",
+            "block",
+            "underline"
+          ],
+          "description": "Style for collaborator cursors"
+        },
+        "codecollab.showCursorNames": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show collaborator names next to their cursors"
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "codecollab.startSession",
+        "key": "ctrl+shift+s",
+        "mac": "cmd+shift+s"
+      },
+      {
+        "command": "codecollab.joinSession",
+        "key": "ctrl+shift+j",
+        "mac": "cmd+shift+j"
+      },
+      {
+        "command": "codecollab.recordVoiceComment",
+        "key": "ctrl+shift+v",
+        "mac": "cmd+shift+v",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "codecollab.openAI",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      },
+      {
+        "command": "codecollab.leaveSession",
+        "key": "ctrl+shift+l",
+        "mac": "cmd+shift+l"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "codecollab.recordVoiceComment",
+          "group": "codecollab@1",
+          "when": "codecollab.inSession"
+        },
+        {
+          "command": "codecollab.playVoiceCommentOnLine",
+          "group": "codecollab@2",
+          "when": "codecollab.inSession"
+        },
+        {
+          "command": "codecollab.openAI",
+          "group": "codecollab@3",
+          "when": "editorHasSelection"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "codecollab.copySessionId",
+          "group": "navigation",
+          "when": "codecollab.inSession"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js",
+    "build:webview": "cd webviews && npm run build"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.19.30",
+    "@types/simple-peer": "^9.11.8",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.19.0",
+    "@typescript-eslint/parser": "^6.19.0",
+    "@vscode/test-electron": "^2.3.8",
+    "eslint": "^8.56.0",
+    "glob": "^10.3.10",
+    "mocha": "^10.2.0",
+    "ts-loader": "^9.5.1",
+    "typescript": "^5.3.3",
+    "webpack": "^5.89.0",
+    "webpack-cli": "^5.1.4"
+  },
+  "dependencies": {
+    "simple-peer": "^9.11.1",
+    "socket.io-client": "^4.7.4",
+    "y-protocols": "^1.0.6",
+    "y-webrtc": "^10.3.0",
+    "yjs": "^13.6.11"
+  }
+}

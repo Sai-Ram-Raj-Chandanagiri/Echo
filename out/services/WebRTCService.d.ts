@@ -1,0 +1,43 @@
+import { User } from '../types';
+type DataHandler = (peerId: string, data: unknown) => void;
+type StreamHandler = (peerId: string, stream: MediaStream) => void;
+type ConnectionHandler = (peerId: string, connected: boolean) => void;
+export declare class WebRTCService {
+    private peers;
+    private localStream;
+    private signalingService;
+    private roomId;
+    private localUserId;
+    private dataHandlers;
+    private streamHandlers;
+    private connectionHandlers;
+    constructor();
+    private setupSignalingHandlers;
+    connect(roomId: string, user: User): Promise<void>;
+    disconnect(): Promise<void>;
+    getLocalStream(video?: boolean, audio?: boolean): Promise<MediaStream | null>;
+    toggleAudio(enabled: boolean): void;
+    toggleVideo(enabled: boolean): void;
+    broadcast(data: unknown): void;
+    sendToPeer(peerId: string, data: unknown): void;
+    onData(handler: DataHandler): void;
+    offData(handler: DataHandler): void;
+    onStream(handler: StreamHandler): void;
+    offStream(handler: StreamHandler): void;
+    onConnection(handler: ConnectionHandler): void;
+    offConnection(handler: ConnectionHandler): void;
+    getPeers(): string[];
+    isPeerConnected(peerId: string): boolean;
+    private createPeerConnection;
+    private setupDataChannel;
+    private closePeerConnection;
+    private handleUserJoined;
+    private handleUserLeft;
+    private handleOffer;
+    private handleAnswer;
+    private handleIceCandidate;
+}
+export declare function getWebRTCService(): WebRTCService;
+export declare function resetWebRTCService(): void;
+export {};
+//# sourceMappingURL=WebRTCService.d.ts.map

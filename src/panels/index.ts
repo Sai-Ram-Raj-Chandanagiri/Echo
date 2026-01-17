@@ -1,0 +1,1 @@
+export { CollabPanel } from './CollabPanel';
