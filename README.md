@@ -1,4 +1,4 @@
-# CodeCollab - Real-Time Collaborative Coding for VS Code
+# Echo CodeCollab - Real-Time Collaborative Coding for VS Code
 
 Real-time collaborative coding with video, voice comments, and AI assistance - all within VS Code.
 
