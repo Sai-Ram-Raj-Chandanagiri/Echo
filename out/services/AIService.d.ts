@@ -1,15 +1,40 @@
-import { AIRequest } from '../types';
+import { AIRequest, AIModelProvider, FileReference, AgenticContext, FileEdit, EditProposal, EditResult, EditApplyResult } from '../types';
 type StreamCallback = (token: string) => void;
 type CompleteCallback = (fullResponse: string) => void;
 type ErrorCallback = (error: Error) => void;
 export declare class AIService {
     private ollamaUrl;
-    private defaultModel;
+    private geminiApiKey;
+    private geminiModel;
+    private currentModel;
     private abortController;
     constructor();
+    private getGeminiEndpoint;
+    getGeminiModel(): string;
+    setGeminiModel(model: string): void;
+    getAvailableGeminiModels(): Record<string, string>;
+    getCurrentModel(): AIModelProvider;
+    setCurrentModel(model: AIModelProvider): void;
+    getAvailableModels(): AIModelProvider[];
+    getModelConfig(model: AIModelProvider): import("../types").AIModelConfig;
+    checkOllamaConnection(): Promise<boolean>;
+    checkGeminiConnection(): Promise<boolean>;
     checkConnection(): Promise<boolean>;
-    getAvailableModels(): Promise<string[]>;
+    getWorkspaceFiles(pattern?: string): Promise<string[]>;
+    readFileContent(filePath: string): Promise<string | null>;
+    searchFilesForContent(searchTerm: string): Promise<FileReference[]>;
+    parseFileReferences(input: string): {
+        cleanedInput: string;
+        filePatterns: string[];
+    };
+    resolveFileReferences(filePatterns: string[]): Promise<FileReference[]>;
+    getFileSuggestions(partialPath: string): Promise<FileReference[]>;
+    private getLanguageFromPath;
+    buildAgenticContext(): Promise<AgenticContext>;
     query(request: AIRequest, onStream?: StreamCallback, onComplete?: CompleteCallback, onError?: ErrorCallback): Promise<string>;
+    private buildFileContextString;
+    private queryGemini;
+    private queryOllama;
     abort(): void;
     private buildPrompt;
     explainCode(code: string): Promise<string>;
@@ -18,7 +43,24 @@ export declare class AIService {
     documentCode(code: string): Promise<string>;
     reviewCode(code: string): Promise<string>;
     chat(message: string, codeContext?: string): Promise<string>;
+    agenticChat(message: string, onStream?: StreamCallback, onComplete?: CompleteCallback, onError?: ErrorCallback): Promise<string>;
     generateSessionSummary(events: string[]): Promise<string>;
+    setGeminiApiKey(apiKey: string): void;
+    private pendingProposals;
+    parseEditBlocks(response: string): FileEdit[];
+    createEditProposal(edits: FileEdit[], summary: string): EditProposal;
+    getProposal(proposalId: string): EditProposal | undefined;
+    getPendingProposals(): EditProposal[];
+    applyFileEdit(edit: FileEdit): Promise<EditResult>;
+    applyEditProposal(proposalId: string): Promise<EditApplyResult>;
+    rejectEditProposal(proposalId: string): boolean;
+    clearProposals(): void;
+    private buildEditModePrompt;
+    agenticEditChat(message: string, onStream?: StreamCallback, onComplete?: CompleteCallback, onError?: ErrorCallback): Promise<{
+        response: string;
+        proposal: EditProposal | null;
+    }>;
+    previewEdit(edit: FileEdit): Promise<void>;
 }
 export declare function getAIService(): AIService;
 export declare function resetAIService(): void;

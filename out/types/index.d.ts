@@ -76,18 +76,111 @@ export interface AIMessage {
     content: string;
     timestamp: number;
     codeContext?: string;
+    fileReferences?: FileReference[];
+    editProposal?: EditProposal;
 }
 export interface AIRequest {
     prompt: string;
     codeContext?: string;
     action?: AIAction;
+    fileReferences?: FileReference[];
+    model?: AIModelProvider;
 }
 export type AIAction = 'explain' | 'fix' | 'refactor' | 'document' | 'review' | 'chat';
+export type AIModelProvider = 'gemma_3' | 'gemini-3-flash' | 'gemini-3-pro' | 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'codellama';
+export interface AIModelConfig {
+    provider: AIModelProvider;
+    name: string;
+    description: string;
+    isOnline: boolean;
+    maxTokens: number;
+    apiModel?: string;
+}
+export declare const AI_MODELS: Record<AIModelProvider, AIModelConfig>;
+export interface FileReference {
+    path: string;
+    relativePath: string;
+    fileName: string;
+    content?: string;
+    language?: string;
+    startLine?: number;
+    endLine?: number;
+}
+export interface AgenticContext {
+    workspaceRoot: string;
+    openFiles: string[];
+    currentFile?: string;
+    selectedText?: string;
+    fileReferences: FileReference[];
+}
+export interface AgenticCapability {
+    name: string;
+    description: string;
+    execute: (context: AgenticContext, params: unknown) => Promise<string>;
+}
+export type FileEditType = 'create' | 'modify' | 'delete' | 'rename';
+export interface FileEdit {
+    id: string;
+    type: FileEditType;
+    filePath: string;
+    originalContent?: string;
+    newContent?: string;
+    newFilePath?: string;
+    startLine?: number;
+    endLine?: number;
+    description?: string;
+}
+export interface EditProposal {
+    id: string;
+    edits: FileEdit[];
+    summary: string;
+    timestamp: number;
+    status: 'pending' | 'approved' | 'rejected' | 'applied' | 'failed';
+    error?: string;
+}
+export interface EditResult {
+    success: boolean;
+    editId: string;
+    filePath: string;
+    error?: string;
+    backupPath?: string;
+}
+export interface EditApplyResult {
+    proposalId: string;
+    results: EditResult[];
+    allSuccessful: boolean;
+    appliedCount: number;
+    failedCount: number;
+}
 export interface OllamaResponse {
     model: string;
     created_at: string;
     response: string;
     done: boolean;
+}
+export interface GeminiRequest {
+    contents: GeminiContent[];
+    generationConfig?: GeminiGenerationConfig;
+}
+export interface GeminiContent {
+    parts: GeminiPart[];
+    role?: 'user' | 'model';
+}
+export interface GeminiPart {
+    text: string;
+}
+export interface GeminiGenerationConfig {
+    temperature?: number;
+    topK?: number;
+    topP?: number;
+    maxOutputTokens?: number;
+}
+export interface GeminiResponse {
+    candidates: GeminiCandidate[];
+}
+export interface GeminiCandidate {
+    content: GeminiContent;
+    finishReason: string;
 }
 export interface TerminalMessage {
     type: 'input' | 'output' | 'resize';

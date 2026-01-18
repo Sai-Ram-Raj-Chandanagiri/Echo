@@ -3,7 +3,7 @@ import { getSessionService, SessionService } from '../services/SessionService';
 import { getAIService, AIService } from '../services/AIService';
 import { getWebRTCService, WebRTCService } from '../services/WebRTCService';
 import { SharedTerminalProvider } from '../providers/SharedTerminalProvider';
-import { User, AIMessage, generateId } from '../types';
+import { User, AIMessage, AIModelProvider, AI_MODELS, FileReference, EditProposal, generateId } from '../types';
 
 // Callback type for voice recording completion
 type VoiceRecordingCallback = (audioData: string, duration: number) => void;
@@ -23,6 +23,9 @@ export class CollabPanel implements vscode.WebviewViewProvider {
   // Media state tracking
   private isVideoEnabled: boolean = false;
   private isAudioEnabled: boolean = false;
+
+  // Edit mode state - when enabled, AI can propose file edits
+  private editModeEnabled: boolean = false;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -123,6 +126,34 @@ export class CollabPanel implements vscode.WebviewViewProvider {
         await this.handleAIAction(message.action as string, message.code as string);
         break;
 
+      case 'switch-model':
+        this.handleSwitchModel(message.model as AIModelProvider);
+        break;
+
+      case 'get-file-suggestions':
+        await this.handleGetFileSuggestions(message.query as string);
+        break;
+
+      case 'get-ai-state':
+        this.sendAIState();
+        break;
+
+      case 'toggle-edit-mode':
+        this.handleToggleEditMode();
+        break;
+
+      case 'apply-edit-proposal':
+        await this.handleApplyEditProposal(message.proposalId as string);
+        break;
+
+      case 'reject-edit-proposal':
+        this.handleRejectEditProposal(message.proposalId as string);
+        break;
+
+      case 'preview-edit':
+        await this.handlePreviewEdit(message.proposalId as string, message.editIndex as number);
+        break;
+
       case 'copy-session-id':
         const session = this.sessionService.getSession();
         if (session) {
@@ -172,46 +203,195 @@ export class CollabPanel implements vscode.WebviewViewProvider {
   }
 
   private async handleAIMessage(text: string): Promise<void> {
+    // Parse file references from input
+    const { filePatterns } = this.aiService.parseFileReferences(text);
+    const fileReferences = await this.aiService.resolveFileReferences(filePatterns);
+
     const userMessage: AIMessage = {
       id: generateId(),
       role: 'user',
       content: text,
       timestamp: Date.now(),
+      fileReferences: fileReferences.length > 0 ? fileReferences : undefined,
     };
     this.aiMessages.push(userMessage);
     this.postMessage({ type: 'ai-messages', messages: this.aiMessages });
 
-    // Get selected code if any
-    const editor = vscode.window.activeTextEditor;
-    const selectedCode = editor?.selection.isEmpty
-      ? undefined
-      : editor?.document.getText(editor.selection);
-
     try {
       let response = '';
-      await this.aiService.query(
-        { prompt: text, codeContext: selectedCode, action: 'chat' },
-        (token) => {
-          response += token;
-          this.postMessage({ type: 'ai-stream', token });
-        },
-        (fullResponse) => {
-          const assistantMessage: AIMessage = {
-            id: generateId(),
-            role: 'assistant',
-            content: fullResponse,
-            timestamp: Date.now(),
-          };
-          this.aiMessages.push(assistantMessage);
-          this.postMessage({ type: 'ai-complete', messages: this.aiMessages });
-        },
-        (error) => {
-          this.postMessage({ type: 'ai-error', error: error.message });
+      let editProposal: any = null;
+
+      if (this.editModeEnabled) {
+        // Use agentic edit chat which can propose file edits
+        const result = await this.aiService.agenticEditChat(
+          text,
+          (token) => {
+            response += token;
+            this.postMessage({ type: 'ai-stream', token });
+          },
+          () => {
+            // Callback is called during request, we'll handle completion after await
+          },
+          (error) => {
+            this.postMessage({ type: 'ai-error', error: error.message });
+          }
+        );
+
+        // Now that await is complete, we have access to result
+        editProposal = result.proposal;
+        response = result.response;
+
+        const assistantMessage: AIMessage = {
+          id: generateId(),
+          role: 'assistant',
+          content: response,
+          timestamp: Date.now(),
+          editProposal: editProposal || undefined,
+        };
+        this.aiMessages.push(assistantMessage);
+        this.postMessage({ type: 'ai-complete', messages: this.aiMessages });
+
+        // If there's an edit proposal, notify the webview
+        if (editProposal) {
+          this.postMessage({
+            type: 'edit-proposal',
+            proposal: editProposal,
+          });
         }
-      );
+      } else {
+        // Use regular agentic chat (read-only)
+        await this.aiService.agenticChat(
+          text,
+          (token) => {
+            response += token;
+            this.postMessage({ type: 'ai-stream', token });
+          },
+          (fullResponse) => {
+            const assistantMessage: AIMessage = {
+              id: generateId(),
+              role: 'assistant',
+              content: fullResponse,
+              timestamp: Date.now(),
+            };
+            this.aiMessages.push(assistantMessage);
+            this.postMessage({ type: 'ai-complete', messages: this.aiMessages });
+          },
+          (error) => {
+            this.postMessage({ type: 'ai-error', error: error.message });
+          }
+        );
+      }
     } catch (error) {
       this.postMessage({ type: 'ai-error', error: (error as Error).message });
     }
+  }
+
+  private handleSwitchModel(model: AIModelProvider): void {
+    this.aiService.setCurrentModel(model);
+    const modelConfig = AI_MODELS[model];
+    vscode.window.showInformationMessage(`AI Model switched to: ${modelConfig.name} (${modelConfig.description})`);
+    this.sendAIState();
+  }
+
+  private async handleGetFileSuggestions(query: string): Promise<void> {
+    try {
+      const suggestions = await this.aiService.getFileSuggestions(query);
+      this.postMessage({
+        type: 'file-suggestions',
+        suggestions: suggestions.map(s => ({
+          path: s.relativePath,
+          fileName: s.fileName,
+          language: s.language,
+        })),
+      });
+    } catch (error) {
+      console.error('[CollabPanel] Failed to get file suggestions:', error);
+      this.postMessage({ type: 'file-suggestions', suggestions: [] });
+    }
+  }
+
+  private sendAIState(): void {
+    const currentModel = this.aiService.getCurrentModel();
+    const modelConfig = AI_MODELS[currentModel];
+    this.postMessage({
+      type: 'ai-state',
+      currentModel,
+      modelConfig,
+      editModeEnabled: this.editModeEnabled,
+      availableModels: Object.entries(AI_MODELS).map(([key, config]) => ({
+        id: key,
+        name: config.name,
+        description: config.description,
+        isOnline: config.isOnline,
+      })),
+    });
+  }
+
+  // ============================================
+  // EDIT MODE HANDLERS
+  // ============================================
+
+  private handleToggleEditMode(): void {
+    this.editModeEnabled = !this.editModeEnabled;
+    const status = this.editModeEnabled ? 'enabled' : 'disabled';
+    vscode.window.showInformationMessage(`Edit Mode ${status}. AI can ${this.editModeEnabled ? 'now propose file edits' : 'no longer propose file edits'}.`);
+    this.sendAIState();
+  }
+
+  private async handleApplyEditProposal(proposalId: string): Promise<void> {
+    try {
+      const result = await this.aiService.applyEditProposal(proposalId);
+
+      if (result.allSuccessful) {
+        vscode.window.showInformationMessage(`Successfully applied ${result.appliedCount} edit(s).`);
+        this.postMessage({
+          type: 'edit-proposal-applied',
+          proposalId,
+          success: true,
+          appliedCount: result.appliedCount,
+        });
+      } else {
+        vscode.window.showWarningMessage(`Applied ${result.appliedCount} edit(s), ${result.failedCount} failed.`);
+        this.postMessage({
+          type: 'edit-proposal-applied',
+          proposalId,
+          success: false,
+          appliedCount: result.appliedCount,
+          failedCount: result.failedCount,
+          errors: result.results.filter(r => !r.success).map(r => r.error),
+        });
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      vscode.window.showErrorMessage(`Failed to apply edits: ${errorMessage}`);
+      this.postMessage({
+        type: 'edit-proposal-applied',
+        proposalId,
+        success: false,
+        error: errorMessage,
+      });
+    }
+  }
+
+  private handleRejectEditProposal(proposalId: string): void {
+    const rejected = this.aiService.rejectEditProposal(proposalId);
+    if (rejected) {
+      vscode.window.showInformationMessage('Edit proposal rejected.');
+      this.postMessage({
+        type: 'edit-proposal-rejected',
+        proposalId,
+      });
+    }
+  }
+
+  private async handlePreviewEdit(proposalId: string, editIndex: number): Promise<void> {
+    const proposal = this.aiService.getProposal(proposalId);
+    if (!proposal || editIndex >= proposal.edits.length) {
+      return;
+    }
+
+    const edit = proposal.edits[editIndex];
+    await this.aiService.previewEdit(edit);
   }
 
   private async handleAIAction(action: string, code?: string): Promise<void> {
@@ -614,6 +794,213 @@ export class CollabPanel implements vscode.WebviewViewProvider {
         .hidden {
           display: none;
         }
+        /* Model selector styles */
+        .model-selector {
+          margin-bottom: 8px;
+        }
+        .model-status {
+          font-size: 10px;
+          color: var(--text-secondary);
+          margin-top: 4px;
+        }
+        .model-status.online {
+          color: var(--accent);
+        }
+        .model-status.offline {
+          color: #ffaa00;
+        }
+        /* Edit mode toggle */
+        .edit-mode-toggle {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          margin-bottom: 8px;
+          padding: 6px 10px;
+          background: var(--bg-secondary);
+          border: 1px solid var(--border);
+          cursor: pointer;
+          transition: all 0.2s;
+        }
+        .edit-mode-toggle:hover {
+          border-color: var(--accent);
+        }
+        .edit-mode-toggle.active {
+          border-color: var(--accent);
+          background: rgba(0, 255, 65, 0.1);
+        }
+        .edit-mode-toggle .toggle-indicator {
+          width: 32px;
+          height: 16px;
+          background: var(--border);
+          border-radius: 8px;
+          position: relative;
+          transition: background 0.2s;
+        }
+        .edit-mode-toggle.active .toggle-indicator {
+          background: var(--accent);
+        }
+        .edit-mode-toggle .toggle-indicator::after {
+          content: '';
+          position: absolute;
+          width: 12px;
+          height: 12px;
+          background: white;
+          border-radius: 50%;
+          top: 2px;
+          left: 2px;
+          transition: left 0.2s;
+        }
+        .edit-mode-toggle.active .toggle-indicator::after {
+          left: 18px;
+        }
+        .edit-mode-label {
+          font-size: 11px;
+          color: var(--text-secondary);
+        }
+        .edit-mode-toggle.active .edit-mode-label {
+          color: var(--accent);
+        }
+        /* Edit proposal styles */
+        .edit-proposal {
+          background: var(--bg-secondary);
+          border: 1px solid #ffaa00;
+          margin-top: 12px;
+          padding: 12px;
+        }
+        .edit-proposal-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          margin-bottom: 8px;
+        }
+        .edit-proposal-title {
+          color: #ffaa00;
+          font-size: 12px;
+          font-weight: bold;
+        }
+        .edit-proposal-summary {
+          font-size: 11px;
+          color: var(--text-secondary);
+          margin-bottom: 8px;
+        }
+        .edit-list {
+          margin-bottom: 12px;
+        }
+        .edit-item {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 6px 8px;
+          background: rgba(0, 0, 0, 0.3);
+          margin-bottom: 4px;
+          font-size: 11px;
+        }
+        .edit-type {
+          padding: 2px 6px;
+          border-radius: 3px;
+          font-size: 9px;
+          font-weight: bold;
+          text-transform: uppercase;
+        }
+        .edit-type.create { background: #00aa00; color: white; }
+        .edit-type.modify { background: #0066cc; color: white; }
+        .edit-type.delete { background: #cc0000; color: white; }
+        .edit-type.rename { background: #aa00aa; color: white; }
+        .edit-path {
+          flex: 1;
+          color: var(--text-primary);
+          font-family: monospace;
+        }
+        .edit-preview-btn {
+          background: transparent;
+          border: 1px solid var(--border);
+          color: var(--text-secondary);
+          padding: 2px 6px;
+          font-size: 10px;
+          cursor: pointer;
+        }
+        .edit-preview-btn:hover {
+          border-color: var(--accent);
+          color: var(--accent);
+        }
+        .edit-proposal-actions {
+          display: flex;
+          gap: 8px;
+        }
+        .edit-proposal-actions .button {
+          flex: 1;
+          font-size: 11px;
+          padding: 6px 12px;
+        }
+        .button.approve {
+          background: var(--accent);
+          color: var(--bg-primary);
+          border-color: var(--accent);
+        }
+        .button.reject {
+          background: transparent;
+          border-color: #ff4444;
+          color: #ff4444;
+        }
+        .button.reject:hover {
+          background: rgba(255, 68, 68, 0.1);
+        }
+        /* AI input container */
+        .ai-input-container {
+          position: relative;
+        }
+        .ai-hint {
+          font-size: 10px;
+          color: var(--text-secondary);
+          margin-top: 4px;
+          margin-bottom: 8px;
+        }
+        /* File suggestions dropdown */
+        .file-suggestions {
+          position: absolute;
+          top: 100%;
+          left: 0;
+          right: 0;
+          background: var(--bg-secondary);
+          border: 1px solid var(--accent);
+          border-top: none;
+          max-height: 200px;
+          overflow-y: auto;
+          z-index: 100;
+        }
+        .file-suggestion {
+          padding: 8px 12px;
+          cursor: pointer;
+          font-size: 12px;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+        .file-suggestion:hover, .file-suggestion.selected {
+          background: var(--accent);
+          color: var(--bg-primary);
+        }
+        .file-suggestion-path {
+          color: var(--text-secondary);
+          font-size: 10px;
+        }
+        .file-suggestion:hover .file-suggestion-path,
+        .file-suggestion.selected .file-suggestion-path {
+          color: var(--bg-secondary);
+        }
+        .file-icon {
+          font-size: 14px;
+        }
+        /* File reference tag in messages */
+        .file-ref-tag {
+          display: inline-block;
+          background: var(--border);
+          padding: 2px 6px;
+          border-radius: 3px;
+          font-size: 10px;
+          margin-right: 4px;
+          color: var(--accent);
+        }
         .status-dot {
           display: inline-block;
           width: 6px;
@@ -742,11 +1129,32 @@ export class CollabPanel implements vscode.WebviewViewProvider {
         <div class="section">
           <div class="section-title">AI Assistant</div>
           <div class="ai-chat">
-            <div class="ai-messages" id="ai-messages"></div>
-            <div class="ai-input-row">
-              <input type="text" id="ai-input" class="input" placeholder="Ask about code..." style="margin-bottom: 0;">
-              <button class="button primary" id="ai-send" style="width: auto; margin-bottom: 0;">Send</button>
+            <!-- Model Selector -->
+            <div class="model-selector">
+              <label for="model-select" style="font-size: 12px; color: #999; display: block; margin-bottom: 4px;">AI Model</label>
+              <select id="model-select" class="input" style="margin-bottom: 8px;">
+                <!-- Options will be populated dynamically -->
+              </select>
+              <div class="model-status" id="model-status" style="font-size: 11px; color: #666; margin-top: 4px;"></div>
             </div>
+            <!-- Edit Mode Toggle -->
+            <div class="edit-mode-toggle" id="edit-mode-toggle">
+              <div class="toggle-indicator"></div>
+              <span class="edit-mode-label">Edit Mode (AI can modify files)</span>
+            </div>
+            <div class="ai-messages" id="ai-messages"></div>
+            <!-- Container for edit proposals -->
+            <div id="edit-proposals-container"></div>
+            <!-- Input with file autocomplete -->
+            <div class="ai-input-container">
+              <div class="ai-input-row">
+                <input type="text" id="ai-input" class="input" placeholder="Ask about code... Use @ to attach files" style="margin-bottom: 0;">
+                <button class="button primary" id="ai-send" style="width: auto; margin-bottom: 0;">Send</button>
+              </div>
+              <!-- File suggestions dropdown -->
+              <div id="file-suggestions" class="file-suggestions hidden"></div>
+            </div>
+            <div class="ai-hint">Tip: Use @filename.ts to include file contents in your question</div>
             <div class="ai-actions">
               <button class="ai-action-btn" data-action="explain">Explain</button>
               <button class="ai-action-btn" data-action="fix">Fix</button>
@@ -831,7 +1239,7 @@ export class CollabPanel implements vscode.WebviewViewProvider {
 
         document.getElementById('ai-send').addEventListener('click', sendAIMessage);
         aiInput.addEventListener('keypress', (e) => {
-          if (e.key === 'Enter') sendAIMessage();
+          if (e.key === 'Enter' && !fileSuggestionsVisible) sendAIMessage();
         });
 
         document.querySelectorAll('.ai-action-btn').forEach(btn => {
@@ -845,8 +1253,314 @@ export class CollabPanel implements vscode.WebviewViewProvider {
           if (text) {
             vscode.postMessage({ type: 'ai-message', text });
             aiInput.value = '';
+            hideFileSuggestions();
           }
         }
+
+        // Model selection
+        const modelSelect = document.getElementById('model-select');
+        const modelStatus = document.getElementById('model-status');
+        let currentModel = 'gemini-3-flash';
+        let availableModels = [];
+
+        modelSelect.addEventListener('change', (e) => {
+          const model = e.target.value;
+          vscode.postMessage({ type: 'switch-model', model });
+        });
+
+        function populateModelOptions(models) {
+          availableModels = models || [];
+          modelSelect.innerHTML = '';
+
+          // Group models by type (Gemini vs Offline)
+          const geminiModels = models.filter(m => m.isOnline);
+          const offlineModels = models.filter(m => !m.isOnline);
+
+          // Add Gemini models group
+          if (geminiModels.length > 0) {
+            const geminiGroup = document.createElement('optgroup');
+            geminiGroup.label = 'Online Models (Gemini)';
+            geminiModels.forEach(m => {
+              const option = document.createElement('option');
+              option.value = m.id;
+              option.textContent = m.name + ' - ' + m.description;
+              geminiGroup.appendChild(option);
+            });
+            modelSelect.appendChild(geminiGroup);
+          }
+
+          // Add Offline models group
+          if (offlineModels.length > 0) {
+            const offlineGroup = document.createElement('optgroup');
+            offlineGroup.label = 'Offline Models';
+            offlineModels.forEach(m => {
+              const option = document.createElement('option');
+              option.value = m.id;
+              option.textContent = m.name + ' - ' + m.description;
+              offlineGroup.appendChild(option);
+            });
+            modelSelect.appendChild(offlineGroup);
+          }
+        }
+
+        function updateModelStatus(model, config, editModeEnabled, models) {
+          currentModel = model;
+
+          // Populate model options FIRST (this clears innerHTML)
+          if (models && models.length > 0) {
+            populateModelOptions(models);
+          }
+
+          // Set the value AFTER options are populated
+          modelSelect.value = model;
+
+          // Update status indicator
+          if (config && config.isOnline) {
+            modelStatus.textContent = '🌐 Online - Requires Gemini API key';
+            modelStatus.className = 'model-status online';
+          } else {
+            modelStatus.textContent = '💻 Offline - Requires Ollama running locally';
+            modelStatus.className = 'model-status offline';
+          }
+
+          // Update edit mode toggle state
+          if (editModeEnabled !== undefined) {
+            updateEditModeToggle(editModeEnabled);
+          }
+        }
+
+        // Edit mode toggle
+        const editModeToggle = document.getElementById('edit-mode-toggle');
+        const editProposalsContainer = document.getElementById('edit-proposals-container');
+        let editModeEnabled = false;
+        let pendingProposals = {};
+
+        editModeToggle.addEventListener('click', () => {
+          vscode.postMessage({ type: 'toggle-edit-mode' });
+        });
+
+        function updateEditModeToggle(enabled) {
+          editModeEnabled = enabled;
+          if (enabled) {
+            editModeToggle.classList.add('active');
+          } else {
+            editModeToggle.classList.remove('active');
+          }
+        }
+
+        function renderEditProposal(proposal) {
+          if (!proposal || proposal.status !== 'pending') return '';
+
+          const editsHtml = proposal.edits.map((edit, index) => {
+            return '<div class="edit-item">' +
+              '<span class="edit-type ' + edit.type + '">' + edit.type + '</span>' +
+              '<span class="edit-path">' + edit.filePath + '</span>' +
+              '<button class="edit-preview-btn" data-proposal-id="' + proposal.id + '" data-edit-index="' + index + '">Preview</button>' +
+            '</div>';
+          }).join('');
+
+          return '<div class="edit-proposal" data-proposal-id="' + proposal.id + '">' +
+            '<div class="edit-proposal-header">' +
+              '<span class="edit-proposal-title">Proposed Changes</span>' +
+            '</div>' +
+            '<div class="edit-proposal-summary">' + proposal.summary + '</div>' +
+            '<div class="edit-list">' + editsHtml + '</div>' +
+            '<div class="edit-proposal-actions">' +
+              '<button class="button approve" data-proposal-id="' + proposal.id + '">Apply Changes</button>' +
+              '<button class="button reject" data-proposal-id="' + proposal.id + '">Reject</button>' +
+            '</div>' +
+          '</div>';
+        }
+
+        function showEditProposal(proposal) {
+          pendingProposals[proposal.id] = proposal;
+          editProposalsContainer.innerHTML = renderEditProposal(proposal);
+
+          // Add event listeners for the buttons
+          const approveBtn = editProposalsContainer.querySelector('.button.approve');
+          const rejectBtn = editProposalsContainer.querySelector('.button.reject');
+          const previewBtns = editProposalsContainer.querySelectorAll('.edit-preview-btn');
+
+          if (approveBtn) {
+            approveBtn.addEventListener('click', () => {
+              vscode.postMessage({ type: 'apply-edit-proposal', proposalId: proposal.id });
+            });
+          }
+
+          if (rejectBtn) {
+            rejectBtn.addEventListener('click', () => {
+              vscode.postMessage({ type: 'reject-edit-proposal', proposalId: proposal.id });
+            });
+          }
+
+          previewBtns.forEach(btn => {
+            btn.addEventListener('click', () => {
+              const proposalId = btn.dataset.proposalId;
+              const editIndex = parseInt(btn.dataset.editIndex, 10);
+              vscode.postMessage({ type: 'preview-edit', proposalId, editIndex });
+            });
+          });
+        }
+
+        function hideEditProposal(proposalId) {
+          delete pendingProposals[proposalId];
+          const proposalEl = editProposalsContainer.querySelector('[data-proposal-id="' + proposalId + '"]');
+          if (proposalEl) {
+            proposalEl.remove();
+          }
+        }
+
+        function updateProposalStatus(proposalId, status, message) {
+          const proposalEl = editProposalsContainer.querySelector('[data-proposal-id="' + proposalId + '"]');
+          if (proposalEl) {
+            if (status === 'applied' || status === 'rejected') {
+              proposalEl.remove();
+              delete pendingProposals[proposalId];
+            }
+          }
+        }
+
+        // File autocomplete
+        const fileSuggestions = document.getElementById('file-suggestions');
+        let fileSuggestionsVisible = false;
+        let selectedSuggestionIndex = -1;
+        let currentSuggestions = [];
+        let atSymbolPosition = -1;
+        let fileSuggestionsTimeout = null;  // Debouncing timeout for file suggestions
+
+        aiInput.addEventListener('input', (e) => {
+          const value = e.target.value;
+          const cursorPos = e.target.selectionStart;
+
+          // Find the last @ symbol before cursor
+          const beforeCursor = value.substring(0, cursorPos);
+          const lastAtIndex = beforeCursor.lastIndexOf('@');
+
+          if (lastAtIndex !== -1) {
+            const afterAt = beforeCursor.substring(lastAtIndex + 1);
+            // Check if there's a space after @, which means it's complete
+            if (!afterAt.includes(' ')) {
+              atSymbolPosition = lastAtIndex;
+
+              // Clear previous timeout to debounce requests
+              if (fileSuggestionsTimeout) {
+                clearTimeout(fileSuggestionsTimeout);
+              }
+
+              // Debounce: wait 300ms after user stops typing before requesting suggestions
+              fileSuggestionsTimeout = setTimeout(() => {
+                vscode.postMessage({ type: 'get-file-suggestions', query: afterAt });
+                fileSuggestionsTimeout = null;
+              }, 300);
+              return;
+            }
+          }
+
+          // Clear timeout if we're no longer in @ context
+          if (fileSuggestionsTimeout) {
+            clearTimeout(fileSuggestionsTimeout);
+            fileSuggestionsTimeout = null;
+          }
+          hideFileSuggestions();
+        });
+
+        aiInput.addEventListener('keydown', (e) => {
+          if (!fileSuggestionsVisible) return;
+
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            selectedSuggestionIndex = Math.min(selectedSuggestionIndex + 1, currentSuggestions.length - 1);
+            updateSuggestionSelection();
+          } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            selectedSuggestionIndex = Math.max(selectedSuggestionIndex - 1, 0);
+            updateSuggestionSelection();
+          } else if (e.key === 'Enter' || e.key === 'Tab') {
+            if (selectedSuggestionIndex >= 0 && currentSuggestions[selectedSuggestionIndex]) {
+              e.preventDefault();
+              selectSuggestion(currentSuggestions[selectedSuggestionIndex]);
+            }
+          } else if (e.key === 'Escape') {
+            hideFileSuggestions();
+          }
+        });
+
+        function showFileSuggestions(suggestions) {
+          currentSuggestions = suggestions;
+          selectedSuggestionIndex = suggestions.length > 0 ? 0 : -1;
+
+          if (suggestions.length === 0) {
+            hideFileSuggestions();
+            return;
+          }
+
+          fileSuggestions.innerHTML = suggestions.map((s, i) => {
+            const icon = getFileIcon(s.language);
+            return '<div class="file-suggestion' + (i === 0 ? ' selected' : '') + '" data-index="' + i + '">' +
+              '<span class="file-icon">' + icon + '</span>' +
+              '<span class="file-name">' + s.fileName + '</span>' +
+              '<span class="file-suggestion-path">' + s.path + '</span>' +
+            '</div>';
+          }).join('');
+
+          // Add click handlers
+          fileSuggestions.querySelectorAll('.file-suggestion').forEach((el, i) => {
+            el.addEventListener('click', () => selectSuggestion(suggestions[i]));
+          });
+
+          fileSuggestions.classList.remove('hidden');
+          fileSuggestionsVisible = true;
+        }
+
+        function hideFileSuggestions() {
+          fileSuggestions.classList.add('hidden');
+          fileSuggestionsVisible = false;
+          selectedSuggestionIndex = -1;
+          atSymbolPosition = -1;
+        }
+
+        function updateSuggestionSelection() {
+          fileSuggestions.querySelectorAll('.file-suggestion').forEach((el, i) => {
+            el.classList.toggle('selected', i === selectedSuggestionIndex);
+          });
+        }
+
+        function selectSuggestion(suggestion) {
+          const value = aiInput.value;
+          const beforeAt = value.substring(0, atSymbolPosition);
+          const afterCursor = value.substring(aiInput.selectionStart);
+
+          // Insert the file name after @
+          aiInput.value = beforeAt + '@' + suggestion.fileName + ' ' + afterCursor.trimStart();
+          aiInput.focus();
+
+          hideFileSuggestions();
+        }
+
+        function getFileIcon(language) {
+          const icons = {
+            'typescript': '📘',
+            'typescriptreact': '⚛️',
+            'javascript': '📒',
+            'javascriptreact': '⚛️',
+            'python': '🐍',
+            'java': '☕',
+            'cpp': '⚙️',
+            'c': '⚙️',
+            'go': '🔵',
+            'rust': '🦀',
+            'ruby': '💎',
+            'php': '🐘',
+            'css': '🎨',
+            'html': '🌐',
+            'json': '📋',
+            'markdown': '📝',
+          };
+          return icons[language] || '📄';
+        }
+
+        // Request AI state on load
+        vscode.postMessage({ type: 'get-ai-state' });
 
         // Handle messages from extension
         window.addEventListener('message', (event) => {
@@ -872,6 +1586,26 @@ export class CollabPanel implements vscode.WebviewViewProvider {
 
             case 'ai-error':
               showAIError(message.error);
+              break;
+
+            case 'ai-state':
+              updateModelStatus(message.currentModel, message.modelConfig, message.editModeEnabled, message.availableModels);
+              break;
+
+            case 'file-suggestions':
+              showFileSuggestions(message.suggestions || []);
+              break;
+
+            case 'edit-proposal':
+              showEditProposal(message.proposal);
+              break;
+
+            case 'edit-proposal-applied':
+              updateProposalStatus(message.proposalId, 'applied');
+              break;
+
+            case 'edit-proposal-rejected':
+              updateProposalStatus(message.proposalId, 'rejected');
               break;
 
             case 'user-joined':

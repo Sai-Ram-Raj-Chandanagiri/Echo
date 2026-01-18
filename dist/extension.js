@@ -42,6 +42,8 @@ class CollabPanel {
     // Media state tracking
     isVideoEnabled = false;
     isAudioEnabled = false;
+    // Edit mode state - when enabled, AI can propose file edits
+    editModeEnabled = false;
     constructor(_extensionUri, context, sharedTerminalProvider) {
         this._extensionUri = _extensionUri;
         this.context = context;
@@ -120,6 +122,27 @@ class CollabPanel {
             case 'ai-action':
                 await this.handleAIAction(message.action, message.code);
                 break;
+            case 'switch-model':
+                this.handleSwitchModel(message.model);
+                break;
+            case 'get-file-suggestions':
+                await this.handleGetFileSuggestions(message.query);
+                break;
+            case 'get-ai-state':
+                this.sendAIState();
+                break;
+            case 'toggle-edit-mode':
+                this.handleToggleEditMode();
+                break;
+            case 'apply-edit-proposal':
+                await this.handleApplyEditProposal(message.proposalId);
+                break;
+            case 'reject-edit-proposal':
+                this.handleRejectEditProposal(message.proposalId);
+                break;
+            case 'preview-edit':
+                await this.handlePreviewEdit(message.proposalId, message.editIndex);
+                break;
             case 'copy-session-id':
                 const session = this.sessionService.getSession();
                 if (session) {
@@ -159,40 +182,174 @@ class CollabPanel {
         }
     }
     async handleAIMessage(text) {
+        // Parse file references from input
+        const { filePatterns } = this.aiService.parseFileReferences(text);
+        const fileReferences = await this.aiService.resolveFileReferences(filePatterns);
         const userMessage = {
             id: (0,_types__WEBPACK_IMPORTED_MODULE_4__.generateId)(),
             role: 'user',
             content: text,
             timestamp: Date.now(),
+            fileReferences: fileReferences.length > 0 ? fileReferences : undefined,
         };
         this.aiMessages.push(userMessage);
         this.postMessage({ type: 'ai-messages', messages: this.aiMessages });
-        // Get selected code if any
-        const editor = vscode__WEBPACK_IMPORTED_MODULE_0__.window.activeTextEditor;
-        const selectedCode = editor?.selection.isEmpty
-            ? undefined
-            : editor?.document.getText(editor.selection);
         try {
             let response = '';
-            await this.aiService.query({ prompt: text, codeContext: selectedCode, action: 'chat' }, (token) => {
-                response += token;
-                this.postMessage({ type: 'ai-stream', token });
-            }, (fullResponse) => {
+            let editProposal = null;
+            if (this.editModeEnabled) {
+                // Use agentic edit chat which can propose file edits
+                const result = await this.aiService.agenticEditChat(text, (token) => {
+                    response += token;
+                    this.postMessage({ type: 'ai-stream', token });
+                }, () => {
+                    // Callback is called during request, we'll handle completion after await
+                }, (error) => {
+                    this.postMessage({ type: 'ai-error', error: error.message });
+                });
+                // Now that await is complete, we have access to result
+                editProposal = result.proposal;
+                response = result.response;
                 const assistantMessage = {
                     id: (0,_types__WEBPACK_IMPORTED_MODULE_4__.generateId)(),
                     role: 'assistant',
-                    content: fullResponse,
+                    content: response,
                     timestamp: Date.now(),
+                    editProposal: editProposal || undefined,
                 };
                 this.aiMessages.push(assistantMessage);
                 this.postMessage({ type: 'ai-complete', messages: this.aiMessages });
-            }, (error) => {
-                this.postMessage({ type: 'ai-error', error: error.message });
-            });
+                // If there's an edit proposal, notify the webview
+                if (editProposal) {
+                    this.postMessage({
+                        type: 'edit-proposal',
+                        proposal: editProposal,
+                    });
+                }
+            }
+            else {
+                // Use regular agentic chat (read-only)
+                await this.aiService.agenticChat(text, (token) => {
+                    response += token;
+                    this.postMessage({ type: 'ai-stream', token });
+                }, (fullResponse) => {
+                    const assistantMessage = {
+                        id: (0,_types__WEBPACK_IMPORTED_MODULE_4__.generateId)(),
+                        role: 'assistant',
+                        content: fullResponse,
+                        timestamp: Date.now(),
+                    };
+                    this.aiMessages.push(assistantMessage);
+                    this.postMessage({ type: 'ai-complete', messages: this.aiMessages });
+                }, (error) => {
+                    this.postMessage({ type: 'ai-error', error: error.message });
+                });
+            }
         }
         catch (error) {
             this.postMessage({ type: 'ai-error', error: error.message });
         }
+    }
+    handleSwitchModel(model) {
+        this.aiService.setCurrentModel(model);
+        const modelConfig = _types__WEBPACK_IMPORTED_MODULE_4__.AI_MODELS[model];
+        vscode__WEBPACK_IMPORTED_MODULE_0__.window.showInformationMessage(`AI Model switched to: ${modelConfig.name} (${modelConfig.description})`);
+        this.sendAIState();
+    }
+    async handleGetFileSuggestions(query) {
+        try {
+            const suggestions = await this.aiService.getFileSuggestions(query);
+            this.postMessage({
+                type: 'file-suggestions',
+                suggestions: suggestions.map(s => ({
+                    path: s.relativePath,
+                    fileName: s.fileName,
+                    language: s.language,
+                })),
+            });
+        }
+        catch (error) {
+            console.error('[CollabPanel] Failed to get file suggestions:', error);
+            this.postMessage({ type: 'file-suggestions', suggestions: [] });
+        }
+    }
+    sendAIState() {
+        const currentModel = this.aiService.getCurrentModel();
+        const modelConfig = _types__WEBPACK_IMPORTED_MODULE_4__.AI_MODELS[currentModel];
+        this.postMessage({
+            type: 'ai-state',
+            currentModel,
+            modelConfig,
+            editModeEnabled: this.editModeEnabled,
+            availableModels: Object.entries(_types__WEBPACK_IMPORTED_MODULE_4__.AI_MODELS).map(([key, config]) => ({
+                id: key,
+                name: config.name,
+                description: config.description,
+                isOnline: config.isOnline,
+            })),
+        });
+    }
+    // ============================================
+    // EDIT MODE HANDLERS
+    // ============================================
+    handleToggleEditMode() {
+        this.editModeEnabled = !this.editModeEnabled;
+        const status = this.editModeEnabled ? 'enabled' : 'disabled';
+        vscode__WEBPACK_IMPORTED_MODULE_0__.window.showInformationMessage(`Edit Mode ${status}. AI can ${this.editModeEnabled ? 'now propose file edits' : 'no longer propose file edits'}.`);
+        this.sendAIState();
+    }
+    async handleApplyEditProposal(proposalId) {
+        try {
+            const result = await this.aiService.applyEditProposal(proposalId);
+            if (result.allSuccessful) {
+                vscode__WEBPACK_IMPORTED_MODULE_0__.window.showInformationMessage(`Successfully applied ${result.appliedCount} edit(s).`);
+                this.postMessage({
+                    type: 'edit-proposal-applied',
+                    proposalId,
+                    success: true,
+                    appliedCount: result.appliedCount,
+                });
+            }
+            else {
+                vscode__WEBPACK_IMPORTED_MODULE_0__.window.showWarningMessage(`Applied ${result.appliedCount} edit(s), ${result.failedCount} failed.`);
+                this.postMessage({
+                    type: 'edit-proposal-applied',
+                    proposalId,
+                    success: false,
+                    appliedCount: result.appliedCount,
+                    failedCount: result.failedCount,
+                    errors: result.results.filter(r => !r.success).map(r => r.error),
+                });
+            }
+        }
+        catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            vscode__WEBPACK_IMPORTED_MODULE_0__.window.showErrorMessage(`Failed to apply edits: ${errorMessage}`);
+            this.postMessage({
+                type: 'edit-proposal-applied',
+                proposalId,
+                success: false,
+                error: errorMessage,
+            });
+        }
+    }
+    handleRejectEditProposal(proposalId) {
+        const rejected = this.aiService.rejectEditProposal(proposalId);
+        if (rejected) {
+            vscode__WEBPACK_IMPORTED_MODULE_0__.window.showInformationMessage('Edit proposal rejected.');
+            this.postMessage({
+                type: 'edit-proposal-rejected',
+                proposalId,
+            });
+        }
+    }
+    async handlePreviewEdit(proposalId, editIndex) {
+        const proposal = this.aiService.getProposal(proposalId);
+        if (!proposal || editIndex >= proposal.edits.length) {
+            return;
+        }
+        const edit = proposal.edits[editIndex];
+        await this.aiService.previewEdit(edit);
     }
     async handleAIAction(action, code) {
         const editor = vscode__WEBPACK_IMPORTED_MODULE_0__.window.activeTextEditor;
@@ -565,6 +722,213 @@ class CollabPanel {
         .hidden {
           display: none;
         }
+        /* Model selector styles */
+        .model-selector {
+          margin-bottom: 8px;
+        }
+        .model-status {
+          font-size: 10px;
+          color: var(--text-secondary);
+          margin-top: 4px;
+        }
+        .model-status.online {
+          color: var(--accent);
+        }
+        .model-status.offline {
+          color: #ffaa00;
+        }
+        /* Edit mode toggle */
+        .edit-mode-toggle {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          margin-bottom: 8px;
+          padding: 6px 10px;
+          background: var(--bg-secondary);
+          border: 1px solid var(--border);
+          cursor: pointer;
+          transition: all 0.2s;
+        }
+        .edit-mode-toggle:hover {
+          border-color: var(--accent);
+        }
+        .edit-mode-toggle.active {
+          border-color: var(--accent);
+          background: rgba(0, 255, 65, 0.1);
+        }
+        .edit-mode-toggle .toggle-indicator {
+          width: 32px;
+          height: 16px;
+          background: var(--border);
+          border-radius: 8px;
+          position: relative;
+          transition: background 0.2s;
+        }
+        .edit-mode-toggle.active .toggle-indicator {
+          background: var(--accent);
+        }
+        .edit-mode-toggle .toggle-indicator::after {
+          content: '';
+          position: absolute;
+          width: 12px;
+          height: 12px;
+          background: white;
+          border-radius: 50%;
+          top: 2px;
+          left: 2px;
+          transition: left 0.2s;
+        }
+        .edit-mode-toggle.active .toggle-indicator::after {
+          left: 18px;
+        }
+        .edit-mode-label {
+          font-size: 11px;
+          color: var(--text-secondary);
+        }
+        .edit-mode-toggle.active .edit-mode-label {
+          color: var(--accent);
+        }
+        /* Edit proposal styles */
+        .edit-proposal {
+          background: var(--bg-secondary);
+          border: 1px solid #ffaa00;
+          margin-top: 12px;
+          padding: 12px;
+        }
+        .edit-proposal-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          margin-bottom: 8px;
+        }
+        .edit-proposal-title {
+          color: #ffaa00;
+          font-size: 12px;
+          font-weight: bold;
+        }
+        .edit-proposal-summary {
+          font-size: 11px;
+          color: var(--text-secondary);
+          margin-bottom: 8px;
+        }
+        .edit-list {
+          margin-bottom: 12px;
+        }
+        .edit-item {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 6px 8px;
+          background: rgba(0, 0, 0, 0.3);
+          margin-bottom: 4px;
+          font-size: 11px;
+        }
+        .edit-type {
+          padding: 2px 6px;
+          border-radius: 3px;
+          font-size: 9px;
+          font-weight: bold;
+          text-transform: uppercase;
+        }
+        .edit-type.create { background: #00aa00; color: white; }
+        .edit-type.modify { background: #0066cc; color: white; }
+        .edit-type.delete { background: #cc0000; color: white; }
+        .edit-type.rename { background: #aa00aa; color: white; }
+        .edit-path {
+          flex: 1;
+          color: var(--text-primary);
+          font-family: monospace;
+        }
+        .edit-preview-btn {
+          background: transparent;
+          border: 1px solid var(--border);
+          color: var(--text-secondary);
+          padding: 2px 6px;
+          font-size: 10px;
+          cursor: pointer;
+        }
+        .edit-preview-btn:hover {
+          border-color: var(--accent);
+          color: var(--accent);
+        }
+        .edit-proposal-actions {
+          display: flex;
+          gap: 8px;
+        }
+        .edit-proposal-actions .button {
+          flex: 1;
+          font-size: 11px;
+          padding: 6px 12px;
+        }
+        .button.approve {
+          background: var(--accent);
+          color: var(--bg-primary);
+          border-color: var(--accent);
+        }
+        .button.reject {
+          background: transparent;
+          border-color: #ff4444;
+          color: #ff4444;
+        }
+        .button.reject:hover {
+          background: rgba(255, 68, 68, 0.1);
+        }
+        /* AI input container */
+        .ai-input-container {
+          position: relative;
+        }
+        .ai-hint {
+          font-size: 10px;
+          color: var(--text-secondary);
+          margin-top: 4px;
+          margin-bottom: 8px;
+        }
+        /* File suggestions dropdown */
+        .file-suggestions {
+          position: absolute;
+          top: 100%;
+          left: 0;
+          right: 0;
+          background: var(--bg-secondary);
+          border: 1px solid var(--accent);
+          border-top: none;
+          max-height: 200px;
+          overflow-y: auto;
+          z-index: 100;
+        }
+        .file-suggestion {
+          padding: 8px 12px;
+          cursor: pointer;
+          font-size: 12px;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+        .file-suggestion:hover, .file-suggestion.selected {
+          background: var(--accent);
+          color: var(--bg-primary);
+        }
+        .file-suggestion-path {
+          color: var(--text-secondary);
+          font-size: 10px;
+        }
+        .file-suggestion:hover .file-suggestion-path,
+        .file-suggestion.selected .file-suggestion-path {
+          color: var(--bg-secondary);
+        }
+        .file-icon {
+          font-size: 14px;
+        }
+        /* File reference tag in messages */
+        .file-ref-tag {
+          display: inline-block;
+          background: var(--border);
+          padding: 2px 6px;
+          border-radius: 3px;
+          font-size: 10px;
+          margin-right: 4px;
+          color: var(--accent);
+        }
         .status-dot {
           display: inline-block;
           width: 6px;
@@ -693,11 +1057,32 @@ class CollabPanel {
         <div class="section">
           <div class="section-title">AI Assistant</div>
           <div class="ai-chat">
-            <div class="ai-messages" id="ai-messages"></div>
-            <div class="ai-input-row">
-              <input type="text" id="ai-input" class="input" placeholder="Ask about code..." style="margin-bottom: 0;">
-              <button class="button primary" id="ai-send" style="width: auto; margin-bottom: 0;">Send</button>
+            <!-- Model Selector -->
+            <div class="model-selector">
+              <label for="model-select" style="font-size: 12px; color: #999; display: block; margin-bottom: 4px;">AI Model</label>
+              <select id="model-select" class="input" style="margin-bottom: 8px;">
+                <!-- Options will be populated dynamically -->
+              </select>
+              <div class="model-status" id="model-status" style="font-size: 11px; color: #666; margin-top: 4px;"></div>
             </div>
+            <!-- Edit Mode Toggle -->
+            <div class="edit-mode-toggle" id="edit-mode-toggle">
+              <div class="toggle-indicator"></div>
+              <span class="edit-mode-label">Edit Mode (AI can modify files)</span>
+            </div>
+            <div class="ai-messages" id="ai-messages"></div>
+            <!-- Container for edit proposals -->
+            <div id="edit-proposals-container"></div>
+            <!-- Input with file autocomplete -->
+            <div class="ai-input-container">
+              <div class="ai-input-row">
+                <input type="text" id="ai-input" class="input" placeholder="Ask about code... Use @ to attach files" style="margin-bottom: 0;">
+                <button class="button primary" id="ai-send" style="width: auto; margin-bottom: 0;">Send</button>
+              </div>
+              <!-- File suggestions dropdown -->
+              <div id="file-suggestions" class="file-suggestions hidden"></div>
+            </div>
+            <div class="ai-hint">Tip: Use @filename.ts to include file contents in your question</div>
             <div class="ai-actions">
               <button class="ai-action-btn" data-action="explain">Explain</button>
               <button class="ai-action-btn" data-action="fix">Fix</button>
@@ -782,7 +1167,7 @@ class CollabPanel {
 
         document.getElementById('ai-send').addEventListener('click', sendAIMessage);
         aiInput.addEventListener('keypress', (e) => {
-          if (e.key === 'Enter') sendAIMessage();
+          if (e.key === 'Enter' && !fileSuggestionsVisible) sendAIMessage();
         });
 
         document.querySelectorAll('.ai-action-btn').forEach(btn => {
@@ -796,8 +1181,314 @@ class CollabPanel {
           if (text) {
             vscode.postMessage({ type: 'ai-message', text });
             aiInput.value = '';
+            hideFileSuggestions();
           }
         }
+
+        // Model selection
+        const modelSelect = document.getElementById('model-select');
+        const modelStatus = document.getElementById('model-status');
+        let currentModel = 'gemini-3-flash';
+        let availableModels = [];
+
+        modelSelect.addEventListener('change', (e) => {
+          const model = e.target.value;
+          vscode.postMessage({ type: 'switch-model', model });
+        });
+
+        function populateModelOptions(models) {
+          availableModels = models || [];
+          modelSelect.innerHTML = '';
+
+          // Group models by type (Gemini vs Offline)
+          const geminiModels = models.filter(m => m.isOnline);
+          const offlineModels = models.filter(m => !m.isOnline);
+
+          // Add Gemini models group
+          if (geminiModels.length > 0) {
+            const geminiGroup = document.createElement('optgroup');
+            geminiGroup.label = 'Online Models (Gemini)';
+            geminiModels.forEach(m => {
+              const option = document.createElement('option');
+              option.value = m.id;
+              option.textContent = m.name + ' - ' + m.description;
+              geminiGroup.appendChild(option);
+            });
+            modelSelect.appendChild(geminiGroup);
+          }
+
+          // Add Offline models group
+          if (offlineModels.length > 0) {
+            const offlineGroup = document.createElement('optgroup');
+            offlineGroup.label = 'Offline Models';
+            offlineModels.forEach(m => {
+              const option = document.createElement('option');
+              option.value = m.id;
+              option.textContent = m.name + ' - ' + m.description;
+              offlineGroup.appendChild(option);
+            });
+            modelSelect.appendChild(offlineGroup);
+          }
+        }
+
+        function updateModelStatus(model, config, editModeEnabled, models) {
+          currentModel = model;
+
+          // Populate model options FIRST (this clears innerHTML)
+          if (models && models.length > 0) {
+            populateModelOptions(models);
+          }
+
+          // Set the value AFTER options are populated
+          modelSelect.value = model;
+
+          // Update status indicator
+          if (config && config.isOnline) {
+            modelStatus.textContent = '🌐 Online - Requires Gemini API key';
+            modelStatus.className = 'model-status online';
+          } else {
+            modelStatus.textContent = '💻 Offline - Requires Ollama running locally';
+            modelStatus.className = 'model-status offline';
+          }
+
+          // Update edit mode toggle state
+          if (editModeEnabled !== undefined) {
+            updateEditModeToggle(editModeEnabled);
+          }
+        }
+
+        // Edit mode toggle
+        const editModeToggle = document.getElementById('edit-mode-toggle');
+        const editProposalsContainer = document.getElementById('edit-proposals-container');
+        let editModeEnabled = false;
+        let pendingProposals = {};
+
+        editModeToggle.addEventListener('click', () => {
+          vscode.postMessage({ type: 'toggle-edit-mode' });
+        });
+
+        function updateEditModeToggle(enabled) {
+          editModeEnabled = enabled;
+          if (enabled) {
+            editModeToggle.classList.add('active');
+          } else {
+            editModeToggle.classList.remove('active');
+          }
+        }
+
+        function renderEditProposal(proposal) {
+          if (!proposal || proposal.status !== 'pending') return '';
+
+          const editsHtml = proposal.edits.map((edit, index) => {
+            return '<div class="edit-item">' +
+              '<span class="edit-type ' + edit.type + '">' + edit.type + '</span>' +
+              '<span class="edit-path">' + edit.filePath + '</span>' +
+              '<button class="edit-preview-btn" data-proposal-id="' + proposal.id + '" data-edit-index="' + index + '">Preview</button>' +
+            '</div>';
+          }).join('');
+
+          return '<div class="edit-proposal" data-proposal-id="' + proposal.id + '">' +
+            '<div class="edit-proposal-header">' +
+              '<span class="edit-proposal-title">Proposed Changes</span>' +
+            '</div>' +
+            '<div class="edit-proposal-summary">' + proposal.summary + '</div>' +
+            '<div class="edit-list">' + editsHtml + '</div>' +
+            '<div class="edit-proposal-actions">' +
+              '<button class="button approve" data-proposal-id="' + proposal.id + '">Apply Changes</button>' +
+              '<button class="button reject" data-proposal-id="' + proposal.id + '">Reject</button>' +
+            '</div>' +
+          '</div>';
+        }
+
+        function showEditProposal(proposal) {
+          pendingProposals[proposal.id] = proposal;
+          editProposalsContainer.innerHTML = renderEditProposal(proposal);
+
+          // Add event listeners for the buttons
+          const approveBtn = editProposalsContainer.querySelector('.button.approve');
+          const rejectBtn = editProposalsContainer.querySelector('.button.reject');
+          const previewBtns = editProposalsContainer.querySelectorAll('.edit-preview-btn');
+
+          if (approveBtn) {
+            approveBtn.addEventListener('click', () => {
+              vscode.postMessage({ type: 'apply-edit-proposal', proposalId: proposal.id });
+            });
+          }
+
+          if (rejectBtn) {
+            rejectBtn.addEventListener('click', () => {
+              vscode.postMessage({ type: 'reject-edit-proposal', proposalId: proposal.id });
+            });
+          }
+
+          previewBtns.forEach(btn => {
+            btn.addEventListener('click', () => {
+              const proposalId = btn.dataset.proposalId;
+              const editIndex = parseInt(btn.dataset.editIndex, 10);
+              vscode.postMessage({ type: 'preview-edit', proposalId, editIndex });
+            });
+          });
+        }
+
+        function hideEditProposal(proposalId) {
+          delete pendingProposals[proposalId];
+          const proposalEl = editProposalsContainer.querySelector('[data-proposal-id="' + proposalId + '"]');
+          if (proposalEl) {
+            proposalEl.remove();
+          }
+        }
+
+        function updateProposalStatus(proposalId, status, message) {
+          const proposalEl = editProposalsContainer.querySelector('[data-proposal-id="' + proposalId + '"]');
+          if (proposalEl) {
+            if (status === 'applied' || status === 'rejected') {
+              proposalEl.remove();
+              delete pendingProposals[proposalId];
+            }
+          }
+        }
+
+        // File autocomplete
+        const fileSuggestions = document.getElementById('file-suggestions');
+        let fileSuggestionsVisible = false;
+        let selectedSuggestionIndex = -1;
+        let currentSuggestions = [];
+        let atSymbolPosition = -1;
+        let fileSuggestionsTimeout = null;  // Debouncing timeout for file suggestions
+
+        aiInput.addEventListener('input', (e) => {
+          const value = e.target.value;
+          const cursorPos = e.target.selectionStart;
+
+          // Find the last @ symbol before cursor
+          const beforeCursor = value.substring(0, cursorPos);
+          const lastAtIndex = beforeCursor.lastIndexOf('@');
+
+          if (lastAtIndex !== -1) {
+            const afterAt = beforeCursor.substring(lastAtIndex + 1);
+            // Check if there's a space after @, which means it's complete
+            if (!afterAt.includes(' ')) {
+              atSymbolPosition = lastAtIndex;
+
+              // Clear previous timeout to debounce requests
+              if (fileSuggestionsTimeout) {
+                clearTimeout(fileSuggestionsTimeout);
+              }
+
+              // Debounce: wait 300ms after user stops typing before requesting suggestions
+              fileSuggestionsTimeout = setTimeout(() => {
+                vscode.postMessage({ type: 'get-file-suggestions', query: afterAt });
+                fileSuggestionsTimeout = null;
+              }, 300);
+              return;
+            }
+          }
+
+          // Clear timeout if we're no longer in @ context
+          if (fileSuggestionsTimeout) {
+            clearTimeout(fileSuggestionsTimeout);
+            fileSuggestionsTimeout = null;
+          }
+          hideFileSuggestions();
+        });
+
+        aiInput.addEventListener('keydown', (e) => {
+          if (!fileSuggestionsVisible) return;
+
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            selectedSuggestionIndex = Math.min(selectedSuggestionIndex + 1, currentSuggestions.length - 1);
+            updateSuggestionSelection();
+          } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            selectedSuggestionIndex = Math.max(selectedSuggestionIndex - 1, 0);
+            updateSuggestionSelection();
+          } else if (e.key === 'Enter' || e.key === 'Tab') {
+            if (selectedSuggestionIndex >= 0 && currentSuggestions[selectedSuggestionIndex]) {
+              e.preventDefault();
+              selectSuggestion(currentSuggestions[selectedSuggestionIndex]);
+            }
+          } else if (e.key === 'Escape') {
+            hideFileSuggestions();
+          }
+        });
+
+        function showFileSuggestions(suggestions) {
+          currentSuggestions = suggestions;
+          selectedSuggestionIndex = suggestions.length > 0 ? 0 : -1;
+
+          if (suggestions.length === 0) {
+            hideFileSuggestions();
+            return;
+          }
+
+          fileSuggestions.innerHTML = suggestions.map((s, i) => {
+            const icon = getFileIcon(s.language);
+            return '<div class="file-suggestion' + (i === 0 ? ' selected' : '') + '" data-index="' + i + '">' +
+              '<span class="file-icon">' + icon + '</span>' +
+              '<span class="file-name">' + s.fileName + '</span>' +
+              '<span class="file-suggestion-path">' + s.path + '</span>' +
+            '</div>';
+          }).join('');
+
+          // Add click handlers
+          fileSuggestions.querySelectorAll('.file-suggestion').forEach((el, i) => {
+            el.addEventListener('click', () => selectSuggestion(suggestions[i]));
+          });
+
+          fileSuggestions.classList.remove('hidden');
+          fileSuggestionsVisible = true;
+        }
+
+        function hideFileSuggestions() {
+          fileSuggestions.classList.add('hidden');
+          fileSuggestionsVisible = false;
+          selectedSuggestionIndex = -1;
+          atSymbolPosition = -1;
+        }
+
+        function updateSuggestionSelection() {
+          fileSuggestions.querySelectorAll('.file-suggestion').forEach((el, i) => {
+            el.classList.toggle('selected', i === selectedSuggestionIndex);
+          });
+        }
+
+        function selectSuggestion(suggestion) {
+          const value = aiInput.value;
+          const beforeAt = value.substring(0, atSymbolPosition);
+          const afterCursor = value.substring(aiInput.selectionStart);
+
+          // Insert the file name after @
+          aiInput.value = beforeAt + '@' + suggestion.fileName + ' ' + afterCursor.trimStart();
+          aiInput.focus();
+
+          hideFileSuggestions();
+        }
+
+        function getFileIcon(language) {
+          const icons = {
+            'typescript': '📘',
+            'typescriptreact': '⚛️',
+            'javascript': '📒',
+            'javascriptreact': '⚛️',
+            'python': '🐍',
+            'java': '☕',
+            'cpp': '⚙️',
+            'c': '⚙️',
+            'go': '🔵',
+            'rust': '🦀',
+            'ruby': '💎',
+            'php': '🐘',
+            'css': '🎨',
+            'html': '🌐',
+            'json': '📋',
+            'markdown': '📝',
+          };
+          return icons[language] || '📄';
+        }
+
+        // Request AI state on load
+        vscode.postMessage({ type: 'get-ai-state' });
 
         // Handle messages from extension
         window.addEventListener('message', (event) => {
@@ -823,6 +1514,26 @@ class CollabPanel {
 
             case 'ai-error':
               showAIError(message.error);
+              break;
+
+            case 'ai-state':
+              updateModelStatus(message.currentModel, message.modelConfig, message.editModeEnabled, message.availableModels);
+              break;
+
+            case 'file-suggestions':
+              showFileSuggestions(message.suggestions || []);
+              break;
+
+            case 'edit-proposal':
+              showEditProposal(message.proposal);
+              break;
+
+            case 'edit-proposal-applied':
+              updateProposalStatus(message.proposalId, 'applied');
+              break;
+
+            case 'edit-proposal-rejected':
+              updateProposalStatus(message.proposalId, 'rejected');
               break;
 
             case 'user-joined':
@@ -1453,10 +2164,64 @@ function resetSessionService() {
 "use strict";
 __webpack_require__.r(__webpack_exports__);
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
+/* harmony export */   AI_MODELS: () => (/* binding */ AI_MODELS),
 /* harmony export */   generateId: () => (/* binding */ generateId),
 /* harmony export */   generateRoomId: () => (/* binding */ generateRoomId),
 /* harmony export */   generateUserColor: () => (/* binding */ generateUserColor)
 /* harmony export */ });
+const AI_MODELS = {
+    // Gemma 3 Model
+    'gemma_3': {
+        provider: 'gemma_3',
+        name: 'Gemma 3',
+        description: 'Fast, efficient - good for most tasks',
+        isOnline: true,
+        maxTokens: 8192,
+        apiModel: 'gemma-3-27b-it',
+    },
+    // Gemini 3 Models
+    'gemini-3-flash': {
+        provider: 'gemini-3-flash',
+        name: 'Gemini 3 Flash',
+        description: 'Fast, efficient - good for most tasks',
+        isOnline: true,
+        maxTokens: 8192,
+        apiModel: 'gemini-3-flash',
+    },
+    'gemini-3-pro': {
+        provider: 'gemini-3-pro',
+        name: 'Gemini 3 Pro',
+        description: 'Most capable, best for complex tasks',
+        isOnline: true,
+        maxTokens: 8192,
+        apiModel: 'gemini-3-pro',
+    },
+    // Gemini 2.5 Models
+    'gemini-2.5-flash': {
+        provider: 'gemini-2.5-flash',
+        name: 'Gemini 2.5 Flash',
+        description: 'Good performance, balanced latency',
+        isOnline: true,
+        maxTokens: 8192,
+        apiModel: 'gemini-2.5-flash',
+    },
+    'gemini-2.5-pro': {
+        provider: 'gemini-2.5-pro',
+        name: 'Gemini 2.5 Pro',
+        description: 'Most capable, handles complex reasoning',
+        isOnline: true,
+        maxTokens: 8192,
+        apiModel: 'gemini-2.5-pro',
+    },
+    // Offline Model
+    codellama: {
+        provider: 'codellama',
+        name: 'CodeLlama 7B',
+        description: 'Offline - Local Processing',
+        isOnline: false,
+        maxTokens: 4096,
+    },
+};
 function generateId() {
     return Math.random().toString(36).substring(2, 9) + Date.now().toString(36);
 }
@@ -29440,17 +30205,90 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */ });
 /* harmony import */ var vscode__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(1);
 /* harmony import */ var vscode__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(vscode__WEBPACK_IMPORTED_MODULE_0__);
+/* harmony import */ var fs__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(13);
+/* harmony import */ var fs__WEBPACK_IMPORTED_MODULE_1___default = /*#__PURE__*/__webpack_require__.n(fs__WEBPACK_IMPORTED_MODULE_1__);
+/* harmony import */ var path__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(107);
+/* harmony import */ var path__WEBPACK_IMPORTED_MODULE_2___default = /*#__PURE__*/__webpack_require__.n(path__WEBPACK_IMPORTED_MODULE_2__);
+/* harmony import */ var _types__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(4);
 
+
+
+
+// ============================================
+// GEMINI MODEL CONFIGURATION
+// Official API Docs: https://ai.google.dev/gemini-api/docs/api-overview
+// Update model names when new versions are released
+// ============================================
+// Gemini API Configuration
+const GEMINI_API_CONFIG = {
+    // Official Google Gemini API endpoint
+    // Format: https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:{ACTION}
+    apiVersion: 'v1beta',
+    action: 'generateContent', // Can be: generateContent, streamGenerateContent, embedContent, batchGenerateContent
+};
+// Available Gemini models - update as new models become available
+// See: https://ai.google.dev/gemini-api/docs/models/gemini
+const GEMINI_MODELS = {
+    GEMMA_3: 'gemma-3-27b-it',
+    FLASH_3: 'gemini-3-flash',
+    PRO_3: 'gemini-3-pro',
+    FLASH_2_5: 'gemini-2.5-flash',
+    PRO_2_5: 'gemini-2.5-pro',
+};
+// Default to Gemini 3 Flash
+const DEFAULT_GEMINI_MODEL = GEMINI_MODELS.FLASH_3;
 class AIService {
     ollamaUrl;
-    defaultModel;
+    geminiApiKey;
+    geminiModel;
+    currentModel;
     abortController = null;
     constructor() {
         const config = vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.getConfiguration('codecollab');
         this.ollamaUrl = config.get('ollamaUrl', 'http://localhost:11434');
-        this.defaultModel = config.get('defaultModel', 'codellama:7b');
+        this.geminiApiKey = config.get('geminiApiKey', '');
+        this.geminiModel = DEFAULT_GEMINI_MODEL; // Default to Gemini 3 Flash
+        this.currentModel = config.get('defaultAIModel', 'gemini-3-flash');
     }
-    async checkConnection() {
+    // Build the complete Gemini API endpoint following official documentation
+    // Pattern: https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:{ACTION}
+    getGeminiEndpoint() {
+        return `https://generativelanguage.googleapis.com/${GEMINI_API_CONFIG.apiVersion}/models/${this.geminiModel}:${GEMINI_API_CONFIG.action}`;
+    }
+    // Get current Gemini model name
+    getGeminiModel() {
+        return this.geminiModel;
+    }
+    // Change Gemini model at runtime
+    setGeminiModel(model) {
+        this.geminiModel = model;
+        console.log(`[AIService] Gemini model switched to: ${model}`);
+    }
+    // Get list of available Gemini models
+    getAvailableGeminiModels() {
+        return { ...GEMINI_MODELS };
+    }
+    // Model management
+    getCurrentModel() {
+        return this.currentModel;
+    }
+    setCurrentModel(model) {
+        this.currentModel = model;
+        // If it's a Gemini model, also update the geminiModel property
+        if (model !== 'codellama' && _types__WEBPACK_IMPORTED_MODULE_3__.AI_MODELS[model]?.apiModel) {
+            this.geminiModel = _types__WEBPACK_IMPORTED_MODULE_3__.AI_MODELS[model].apiModel;
+            console.log(`[AIService] Gemini model switched to: ${this.geminiModel}`);
+        }
+        console.log(`[AIService] Model switched to: ${model}`);
+    }
+    getAvailableModels() {
+        return Object.keys(_types__WEBPACK_IMPORTED_MODULE_3__.AI_MODELS);
+    }
+    getModelConfig(model) {
+        return _types__WEBPACK_IMPORTED_MODULE_3__.AI_MODELS[model];
+    }
+    // Connection checks
+    async checkOllamaConnection() {
         try {
             const response = await fetch(`${this.ollamaUrl}/api/tags`, {
                 method: 'GET',
@@ -29463,21 +30301,284 @@ class AIService {
             return false;
         }
     }
-    async getAvailableModels() {
+    async checkGeminiConnection() {
+        if (!this.geminiApiKey) {
+            return false;
+        }
         try {
-            const response = await fetch(`${this.ollamaUrl}/api/tags`);
-            if (!response.ok) {
-                throw new Error('Failed to fetch models');
-            }
-            const data = await response.json();
-            return data.models?.map((m) => m.name) ?? [];
+            // Simple validation - just check if API key format looks valid
+            return this.geminiApiKey.length > 10;
         }
         catch (error) {
-            console.error('[AIService] Failed to get models:', error);
-            return [];
+            console.error('[AIService] Gemini API key validation failed:', error);
+            return false;
         }
     }
+    async checkConnection() {
+        if (this.currentModel === 'codellama') {
+            return this.checkOllamaConnection();
+        }
+        // All other models are Gemini variants
+        return this.checkGeminiConnection();
+    }
+    // File system access for agentic capabilities
+    async getWorkspaceFiles(pattern) {
+        const workspaceFolders = vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.workspaceFolders;
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            return [];
+        }
+        const globPattern = pattern || '**/*.{ts,tsx,js,jsx,py,java,cpp,c,h,go,rs,rb,php,css,html,json,md}';
+        const files = await vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.findFiles(globPattern, '**/node_modules/**', 1000);
+        return files.map(f => f.fsPath);
+    }
+    async readFileContent(filePath) {
+        try {
+            // First try to read from VS Code's open documents
+            const uri = vscode__WEBPACK_IMPORTED_MODULE_0__.Uri.file(filePath);
+            const openDoc = vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.textDocuments.find(doc => doc.uri.fsPath === filePath);
+            if (openDoc) {
+                return openDoc.getText();
+            }
+            // Otherwise read from disk
+            if (fs__WEBPACK_IMPORTED_MODULE_1__.existsSync(filePath)) {
+                return fs__WEBPACK_IMPORTED_MODULE_1__.readFileSync(filePath, 'utf-8');
+            }
+            return null;
+        }
+        catch (error) {
+            console.error(`[AIService] Failed to read file: ${filePath}`, error);
+            return null;
+        }
+    }
+    async searchFilesForContent(searchTerm) {
+        const workspaceFolders = vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.workspaceFolders;
+        if (!workspaceFolders) {
+            return [];
+        }
+        const results = [];
+        const files = await this.getWorkspaceFiles();
+        for (const filePath of files.slice(0, 100)) { // Limit to 100 files for performance
+            try {
+                const content = await this.readFileContent(filePath);
+                if (content && content.toLowerCase().includes(searchTerm.toLowerCase())) {
+                    const workspaceRoot = workspaceFolders[0].uri.fsPath;
+                    results.push({
+                        path: filePath,
+                        relativePath: path__WEBPACK_IMPORTED_MODULE_2__.relative(workspaceRoot, filePath),
+                        fileName: path__WEBPACK_IMPORTED_MODULE_2__.basename(filePath),
+                        language: this.getLanguageFromPath(filePath),
+                    });
+                }
+            }
+            catch (error) {
+                // Skip files that can't be read
+            }
+        }
+        return results.slice(0, 20); // Return top 20 matches
+    }
+    // Parse '@' file references from user input
+    parseFileReferences(input) {
+        const filePatterns = [];
+        // Match @filename.ext or @path/to/file.ext patterns
+        const regex = /@([\w\-./]+\.\w+)/g;
+        let match;
+        while ((match = regex.exec(input)) !== null) {
+            filePatterns.push(match[1]);
+        }
+        // Remove the @ references from the input for cleaner prompt
+        const cleanedInput = input.replace(regex, '').replace(/\s+/g, ' ').trim();
+        return { cleanedInput, filePatterns };
+    }
+    async resolveFileReferences(filePatterns) {
+        const workspaceFolders = vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.workspaceFolders;
+        if (!workspaceFolders || filePatterns.length === 0) {
+            return [];
+        }
+        const workspaceRoot = workspaceFolders[0].uri.fsPath;
+        const references = [];
+        for (const pattern of filePatterns) {
+            // Try to find the file in workspace
+            const files = await vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.findFiles(`**/${pattern}`, '**/node_modules/**', 5);
+            for (const file of files) {
+                const content = await this.readFileContent(file.fsPath);
+                if (content) {
+                    references.push({
+                        path: file.fsPath,
+                        relativePath: path__WEBPACK_IMPORTED_MODULE_2__.relative(workspaceRoot, file.fsPath),
+                        fileName: path__WEBPACK_IMPORTED_MODULE_2__.basename(file.fsPath),
+                        content: content,
+                        language: this.getLanguageFromPath(file.fsPath),
+                    });
+                }
+            }
+        }
+        return references;
+    }
+    // Get file suggestions for autocomplete
+    async getFileSuggestions(partialPath) {
+        const workspaceFolders = vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.workspaceFolders;
+        if (!workspaceFolders) {
+            return [];
+        }
+        const workspaceRoot = workspaceFolders[0].uri.fsPath;
+        const pattern = partialPath ? `**/*${partialPath}*` : '**/*';
+        const files = await vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.findFiles(pattern, '**/node_modules/**', 20);
+        return files.map(file => ({
+            path: file.fsPath,
+            relativePath: path__WEBPACK_IMPORTED_MODULE_2__.relative(workspaceRoot, file.fsPath),
+            fileName: path__WEBPACK_IMPORTED_MODULE_2__.basename(file.fsPath),
+            language: this.getLanguageFromPath(file.fsPath),
+        }));
+    }
+    getLanguageFromPath(filePath) {
+        const ext = path__WEBPACK_IMPORTED_MODULE_2__.extname(filePath).toLowerCase();
+        const languageMap = {
+            '.ts': 'typescript',
+            '.tsx': 'typescriptreact',
+            '.js': 'javascript',
+            '.jsx': 'javascriptreact',
+            '.py': 'python',
+            '.java': 'java',
+            '.cpp': 'cpp',
+            '.c': 'c',
+            '.h': 'c',
+            '.go': 'go',
+            '.rs': 'rust',
+            '.rb': 'ruby',
+            '.php': 'php',
+            '.css': 'css',
+            '.html': 'html',
+            '.json': 'json',
+            '.md': 'markdown',
+        };
+        return languageMap[ext] || 'plaintext';
+    }
+    // Build context for agentic AI
+    async buildAgenticContext() {
+        const workspaceFolders = vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.workspaceFolders;
+        const editor = vscode__WEBPACK_IMPORTED_MODULE_0__.window.activeTextEditor;
+        return {
+            workspaceRoot: workspaceFolders?.[0]?.uri.fsPath || '',
+            openFiles: vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.textDocuments
+                .filter(doc => doc.uri.scheme === 'file')
+                .map(doc => doc.uri.fsPath),
+            currentFile: editor?.document.uri.fsPath,
+            selectedText: editor?.selection.isEmpty
+                ? undefined
+                : editor?.document.getText(editor.selection),
+            fileReferences: [],
+        };
+    }
+    // Main query method with model switching
     async query(request, onStream, onComplete, onError) {
+        const modelToUse = request.model || this.currentModel;
+        // Parse and resolve file references if present
+        let fileContext = '';
+        if (request.fileReferences && request.fileReferences.length > 0) {
+            fileContext = this.buildFileContextString(request.fileReferences);
+        }
+        const enhancedRequest = {
+            ...request,
+            prompt: fileContext ? `${request.prompt}\n\nReferenced Files:\n${fileContext}` : request.prompt,
+        };
+        // Check if it's a Gemini model (any of the Gemini variants) or CodeLlama
+        if (modelToUse === 'codellama') {
+            return this.queryOllama(enhancedRequest, onStream, onComplete, onError);
+        }
+        else {
+            // All other models are Gemini variants
+            return this.queryGemini(enhancedRequest, onStream, onComplete, onError);
+        }
+    }
+    buildFileContextString(fileReferences) {
+        return fileReferences
+            .map(ref => {
+            const header = `--- ${ref.relativePath} (${ref.language || 'unknown'}) ---`;
+            const content = ref.content || '[Content not loaded]';
+            return `${header}\n${content}\n`;
+        })
+            .join('\n');
+    }
+    // Gemini API query
+    async queryGemini(request, onStream, onComplete, onError) {
+        if (!this.geminiApiKey) {
+            const error = new Error('Gemini API key not configured. Go to Settings > CodeCollab > Gemini API Key');
+            onError?.(error);
+            throw error;
+        }
+        const prompt = this.buildPrompt(request);
+        try {
+            this.abortController = new AbortController();
+            const geminiRequest = {
+                contents: [
+                    {
+                        parts: [{ text: prompt }],
+                        role: 'user',
+                    },
+                ],
+                generationConfig: {
+                    temperature: 0.7,
+                    maxOutputTokens: _types__WEBPACK_IMPORTED_MODULE_3__.AI_MODELS[this.currentModel]?.maxTokens || 8192,
+                },
+            };
+            // Use header-based authentication as per Google API documentation
+            const response = await fetch(this.getGeminiEndpoint(), {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': this.geminiApiKey,
+                },
+                body: JSON.stringify(geminiRequest),
+                signal: this.abortController.signal,
+            });
+            if (!response.ok) {
+                const errorText = await response.text();
+                if (response.status === 400) {
+                    throw new Error(`Gemini API error: Invalid request. ${errorText}`);
+                }
+                else if (response.status === 403) {
+                    throw new Error('Gemini API key is invalid or expired. Please check your API key in settings.');
+                }
+                else if (response.status === 429) {
+                    throw new Error('Gemini API rate limit exceeded. Please wait and try again.');
+                }
+                throw new Error(`Gemini API error: ${response.status} ${response.statusText}`);
+            }
+            const data = await response.json();
+            if (!data.candidates || data.candidates.length === 0) {
+                throw new Error('No response from Gemini');
+            }
+            const fullResponse = data.candidates[0].content.parts
+                .map(part => part.text)
+                .join('');
+            // Simulate streaming for consistent UX
+            if (onStream) {
+                const words = fullResponse.split(' ');
+                for (let i = 0; i < words.length; i++) {
+                    onStream(words[i] + (i < words.length - 1 ? ' ' : ''));
+                    await new Promise(resolve => setTimeout(resolve, 20)); // Small delay for streaming effect
+                }
+            }
+            onComplete?.(fullResponse);
+            return fullResponse;
+        }
+        catch (error) {
+            if (error instanceof Error) {
+                if (error.name === 'AbortError') {
+                    console.log('[AIService] Gemini request aborted');
+                    return '';
+                }
+                onError?.(error);
+                throw error;
+            }
+            throw error;
+        }
+        finally {
+            this.abortController = null;
+        }
+    }
+    // Ollama API query (existing implementation enhanced)
+    async queryOllama(request, onStream, onComplete, onError) {
         const prompt = this.buildPrompt(request);
         try {
             this.abortController = new AbortController();
@@ -29485,7 +30586,7 @@ class AIService {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    model: this.defaultModel,
+                    model: 'codellama:7b',
                     prompt: prompt,
                     stream: true,
                 }),
@@ -29493,7 +30594,7 @@ class AIService {
             });
             if (!response.ok) {
                 if (response.status === 404) {
-                    throw new Error(`Model '${this.defaultModel}' not found. Run: ollama pull ${this.defaultModel}`);
+                    throw new Error(`Model 'codellama:7b' not found. Run: ollama pull codellama:7b`);
                 }
                 throw new Error(`Ollama request failed: ${response.status} ${response.statusText}. Is Ollama running? (ollama serve)`);
             }
@@ -29532,7 +30633,7 @@ class AIService {
         catch (error) {
             if (error instanceof Error) {
                 if (error.name === 'AbortError') {
-                    console.log('[AIService] Request aborted');
+                    console.log('[AIService] Ollama request aborted');
                     return '';
                 }
                 onError?.(error);
@@ -29570,13 +30671,14 @@ class AIService {
                 systemPrompt = `You are a helpful coding assistant. Review the following code for potential issues, security vulnerabilities, or improvements. Be specific and constructive.`;
                 break;
             default:
-                systemPrompt = `You are a helpful coding assistant. Answer the following question or request about code.`;
+                systemPrompt = `You are a helpful coding assistant with access to the user's codebase. You can analyze files, understand code structure, and provide detailed assistance. Answer the following question or request about code.`;
         }
         if (codeContext) {
             return `${systemPrompt}\n\n${prompt}\n\nCode:\n\`\`\`\n${codeContext}\n\`\`\``;
         }
         return `${systemPrompt}\n\n${prompt}`;
     }
+    // Convenience methods
     async explainCode(code) {
         return this.query({
             prompt: 'Explain this code:',
@@ -29620,12 +30722,403 @@ class AIService {
             action: 'chat',
         });
     }
+    // Agentic chat with file references
+    async agenticChat(message, onStream, onComplete, onError) {
+        // Parse file references from message
+        const { cleanedInput, filePatterns } = this.parseFileReferences(message);
+        // Resolve file references
+        const fileReferences = await this.resolveFileReferences(filePatterns);
+        // Get current context
+        const context = await this.buildAgenticContext();
+        // Build enhanced prompt with context
+        let enhancedPrompt = cleanedInput;
+        if (context.selectedText) {
+            enhancedPrompt += `\n\nCurrently selected code:\n\`\`\`\n${context.selectedText}\n\`\`\``;
+        }
+        if (context.currentFile) {
+            enhancedPrompt += `\n\nCurrent file: ${path__WEBPACK_IMPORTED_MODULE_2__.basename(context.currentFile)}`;
+        }
+        return this.query({
+            prompt: enhancedPrompt,
+            fileReferences,
+            action: 'chat',
+        }, onStream, onComplete, onError);
+    }
     async generateSessionSummary(events) {
         const eventsText = events.join('\n');
         return this.query({
             prompt: `Generate a brief summary of this coding session based on the following events:\n\n${eventsText}\n\nProvide a concise summary including: what was worked on, key decisions made, and any notable changes.`,
             action: 'chat',
         });
+    }
+    // Update Gemini API key
+    setGeminiApiKey(apiKey) {
+        this.geminiApiKey = apiKey;
+    }
+    // ============================================
+    // FILE EDITING CAPABILITIES
+    // ============================================
+    // Store for pending edit proposals
+    pendingProposals = new Map();
+    // Parse AI response for file edit blocks
+    // Expected format:
+    // ```edit:path/to/file.ts
+    // <new file content>
+    // ```
+    // Or for creating new files:
+    // ```create:path/to/new-file.ts
+    // <file content>
+    // ```
+    parseEditBlocks(response) {
+        const edits = [];
+        // Match edit blocks: ```edit:filepath or ```create:filepath or ```delete:filepath
+        const editBlockRegex = /```(edit|create|delete|rename):([^\n]+)\n([\s\S]*?)```/g;
+        let match;
+        while ((match = editBlockRegex.exec(response)) !== null) {
+            const [, action, filePath, content] = match;
+            const normalizedPath = filePath.trim();
+            const edit = {
+                id: (0,_types__WEBPACK_IMPORTED_MODULE_3__.generateId)(),
+                type: action,
+                filePath: normalizedPath,
+                description: `${action} ${normalizedPath}`,
+            };
+            if (action === 'edit') {
+                edit.type = 'modify';
+                edit.newContent = content.trim();
+            }
+            else if (action === 'create') {
+                edit.type = 'create';
+                edit.newContent = content.trim();
+            }
+            else if (action === 'delete') {
+                edit.type = 'delete';
+            }
+            else if (action === 'rename') {
+                edit.type = 'rename';
+                edit.newFilePath = content.trim();
+            }
+            edits.push(edit);
+        }
+        return edits;
+    }
+    // Create an edit proposal from parsed edits
+    createEditProposal(edits, summary) {
+        const proposal = {
+            id: (0,_types__WEBPACK_IMPORTED_MODULE_3__.generateId)(),
+            edits,
+            summary,
+            timestamp: Date.now(),
+            status: 'pending',
+        };
+        this.pendingProposals.set(proposal.id, proposal);
+        return proposal;
+    }
+    // Get a pending proposal by ID
+    getProposal(proposalId) {
+        return this.pendingProposals.get(proposalId);
+    }
+    // Get all pending proposals
+    getPendingProposals() {
+        return Array.from(this.pendingProposals.values()).filter(p => p.status === 'pending');
+    }
+    // Apply a single file edit
+    async applyFileEdit(edit) {
+        const workspaceFolders = vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.workspaceFolders;
+        if (!workspaceFolders) {
+            return {
+                success: false,
+                editId: edit.id,
+                filePath: edit.filePath,
+                error: 'No workspace folder open',
+            };
+        }
+        const workspaceRoot = workspaceFolders[0].uri.fsPath;
+        const fullPath = path__WEBPACK_IMPORTED_MODULE_2__.isAbsolute(edit.filePath)
+            ? edit.filePath
+            : path__WEBPACK_IMPORTED_MODULE_2__.join(workspaceRoot, edit.filePath);
+        const uri = vscode__WEBPACK_IMPORTED_MODULE_0__.Uri.file(fullPath);
+        try {
+            switch (edit.type) {
+                case 'create': {
+                    if (!edit.newContent) {
+                        return { success: false, editId: edit.id, filePath: edit.filePath, error: 'No content provided for create' };
+                    }
+                    // Ensure directory exists
+                    const dir = path__WEBPACK_IMPORTED_MODULE_2__.dirname(fullPath);
+                    if (!fs__WEBPACK_IMPORTED_MODULE_1__.existsSync(dir)) {
+                        fs__WEBPACK_IMPORTED_MODULE_1__.mkdirSync(dir, { recursive: true });
+                    }
+                    // Create the file
+                    const encoder = new TextEncoder();
+                    await vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.fs.writeFile(uri, encoder.encode(edit.newContent));
+                    // Open the newly created file
+                    const doc = await vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.openTextDocument(uri);
+                    await vscode__WEBPACK_IMPORTED_MODULE_0__.window.showTextDocument(doc, { preview: false });
+                    return { success: true, editId: edit.id, filePath: edit.filePath };
+                }
+                case 'modify': {
+                    if (!edit.newContent) {
+                        return { success: false, editId: edit.id, filePath: edit.filePath, error: 'No content provided for modify' };
+                    }
+                    // Check if file exists
+                    if (!fs__WEBPACK_IMPORTED_MODULE_1__.existsSync(fullPath)) {
+                        return { success: false, editId: edit.id, filePath: edit.filePath, error: 'File does not exist' };
+                    }
+                    // Store original content for backup
+                    const originalContent = fs__WEBPACK_IMPORTED_MODULE_1__.readFileSync(fullPath, 'utf-8');
+                    edit.originalContent = originalContent;
+                    // Apply the edit using VS Code's WorkspaceEdit API
+                    const document = await vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.openTextDocument(uri);
+                    const workspaceEdit = new vscode__WEBPACK_IMPORTED_MODULE_0__.WorkspaceEdit();
+                    // Replace entire content or specific lines
+                    if (edit.startLine !== undefined && edit.endLine !== undefined) {
+                        const startPos = new vscode__WEBPACK_IMPORTED_MODULE_0__.Position(edit.startLine - 1, 0);
+                        const endPos = new vscode__WEBPACK_IMPORTED_MODULE_0__.Position(edit.endLine, 0);
+                        workspaceEdit.replace(uri, new vscode__WEBPACK_IMPORTED_MODULE_0__.Range(startPos, endPos), edit.newContent + '\n');
+                    }
+                    else {
+                        const fullRange = new vscode__WEBPACK_IMPORTED_MODULE_0__.Range(document.lineAt(0).range.start, document.lineAt(document.lineCount - 1).range.end);
+                        workspaceEdit.replace(uri, fullRange, edit.newContent);
+                    }
+                    const applied = await vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.applyEdit(workspaceEdit);
+                    if (applied) {
+                        await document.save();
+                        await vscode__WEBPACK_IMPORTED_MODULE_0__.window.showTextDocument(document, { preview: false });
+                        return { success: true, editId: edit.id, filePath: edit.filePath };
+                    }
+                    else {
+                        return { success: false, editId: edit.id, filePath: edit.filePath, error: 'Failed to apply edit' };
+                    }
+                }
+                case 'delete': {
+                    if (!fs__WEBPACK_IMPORTED_MODULE_1__.existsSync(fullPath)) {
+                        return { success: false, editId: edit.id, filePath: edit.filePath, error: 'File does not exist' };
+                    }
+                    // Store original content before deletion
+                    edit.originalContent = fs__WEBPACK_IMPORTED_MODULE_1__.readFileSync(fullPath, 'utf-8');
+                    await vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.fs.delete(uri);
+                    return { success: true, editId: edit.id, filePath: edit.filePath };
+                }
+                case 'rename': {
+                    if (!edit.newFilePath) {
+                        return { success: false, editId: edit.id, filePath: edit.filePath, error: 'No new file path provided for rename' };
+                    }
+                    if (!fs__WEBPACK_IMPORTED_MODULE_1__.existsSync(fullPath)) {
+                        return { success: false, editId: edit.id, filePath: edit.filePath, error: 'File does not exist' };
+                    }
+                    const newFullPath = path__WEBPACK_IMPORTED_MODULE_2__.isAbsolute(edit.newFilePath)
+                        ? edit.newFilePath
+                        : path__WEBPACK_IMPORTED_MODULE_2__.join(workspaceRoot, edit.newFilePath);
+                    const newUri = vscode__WEBPACK_IMPORTED_MODULE_0__.Uri.file(newFullPath);
+                    // Ensure target directory exists
+                    const newDir = path__WEBPACK_IMPORTED_MODULE_2__.dirname(newFullPath);
+                    if (!fs__WEBPACK_IMPORTED_MODULE_1__.existsSync(newDir)) {
+                        fs__WEBPACK_IMPORTED_MODULE_1__.mkdirSync(newDir, { recursive: true });
+                    }
+                    await vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.fs.rename(uri, newUri);
+                    // Open the renamed file
+                    const doc = await vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.openTextDocument(newUri);
+                    await vscode__WEBPACK_IMPORTED_MODULE_0__.window.showTextDocument(doc, { preview: false });
+                    return { success: true, editId: edit.id, filePath: edit.filePath };
+                }
+                default:
+                    return { success: false, editId: edit.id, filePath: edit.filePath, error: `Unknown edit type: ${edit.type}` };
+            }
+        }
+        catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            console.error(`[AIService] Failed to apply edit to ${edit.filePath}:`, error);
+            return { success: false, editId: edit.id, filePath: edit.filePath, error: errorMessage };
+        }
+    }
+    // Apply all edits in a proposal
+    async applyEditProposal(proposalId) {
+        const proposal = this.pendingProposals.get(proposalId);
+        if (!proposal) {
+            return {
+                proposalId,
+                results: [],
+                allSuccessful: false,
+                appliedCount: 0,
+                failedCount: 0,
+            };
+        }
+        const results = [];
+        let appliedCount = 0;
+        let failedCount = 0;
+        for (const edit of proposal.edits) {
+            const result = await this.applyFileEdit(edit);
+            results.push(result);
+            if (result.success) {
+                appliedCount++;
+            }
+            else {
+                failedCount++;
+            }
+        }
+        // Update proposal status
+        proposal.status = failedCount === 0 ? 'applied' : 'failed';
+        if (failedCount > 0) {
+            proposal.error = `${failedCount} edit(s) failed to apply`;
+        }
+        return {
+            proposalId,
+            results,
+            allSuccessful: failedCount === 0,
+            appliedCount,
+            failedCount,
+        };
+    }
+    // Reject an edit proposal
+    rejectEditProposal(proposalId) {
+        const proposal = this.pendingProposals.get(proposalId);
+        if (!proposal) {
+            return false;
+        }
+        proposal.status = 'rejected';
+        return true;
+    }
+    // Clear all pending proposals
+    clearProposals() {
+        this.pendingProposals.clear();
+    }
+    // Build prompt for edit mode - instructs AI to format responses with edit blocks
+    buildEditModePrompt(request) {
+        const { prompt, codeContext, fileReferences } = request;
+        const editInstructions = `You are an AI coding assistant that can edit files directly. When you need to modify, create, or delete files, use the following format:
+
+To MODIFY an existing file (replace entire content):
+\`\`\`edit:path/to/file.ts
+<complete new file content here>
+\`\`\`
+
+To CREATE a new file:
+\`\`\`create:path/to/new-file.ts
+<file content here>
+\`\`\`
+
+To DELETE a file:
+\`\`\`delete:path/to/file.ts
+\`\`\`
+
+To RENAME a file:
+\`\`\`rename:path/to/old-file.ts
+path/to/new-file.ts
+\`\`\`
+
+Important guidelines:
+- Always provide the COMPLETE file content when editing, not just the changes
+- Use relative paths from the workspace root
+- Explain what changes you're making before providing the edit blocks
+- You can include multiple edit blocks in a single response
+- Only suggest edits when the user asks for changes or fixes
+
+`;
+        let fullPrompt = editInstructions;
+        // Add file references context
+        if (fileReferences && fileReferences.length > 0) {
+            fullPrompt += '\nReferenced Files:\n';
+            fullPrompt += this.buildFileContextString(fileReferences);
+            fullPrompt += '\n';
+        }
+        // Add code context if provided
+        if (codeContext) {
+            fullPrompt += `\nCode Context:\n\`\`\`\n${codeContext}\n\`\`\`\n`;
+        }
+        fullPrompt += `\nUser Request: ${prompt}`;
+        return fullPrompt;
+    }
+    // Agentic chat with file editing capabilities
+    async agenticEditChat(message, onStream, onComplete, onError) {
+        // Parse file references from message
+        const { cleanedInput, filePatterns } = this.parseFileReferences(message);
+        const fileReferences = await this.resolveFileReferences(filePatterns);
+        // Get current context
+        const context = await this.buildAgenticContext();
+        // Build enhanced prompt with edit mode instructions
+        let enhancedPrompt = cleanedInput;
+        if (context.selectedText) {
+            enhancedPrompt += `\n\nCurrently selected code:\n\`\`\`\n${context.selectedText}\n\`\`\``;
+        }
+        if (context.currentFile) {
+            enhancedPrompt += `\n\nCurrent file: ${context.currentFile}`;
+            // Include current file content if not already in references
+            if (!fileReferences.find(f => f.path === context.currentFile)) {
+                const content = await this.readFileContent(context.currentFile);
+                if (content) {
+                    fileReferences.push({
+                        path: context.currentFile,
+                        relativePath: path__WEBPACK_IMPORTED_MODULE_2__.basename(context.currentFile),
+                        fileName: path__WEBPACK_IMPORTED_MODULE_2__.basename(context.currentFile),
+                        content,
+                        language: this.getLanguageFromPath(context.currentFile),
+                    });
+                }
+            }
+        }
+        // Use edit mode prompt builder
+        const fullPrompt = this.buildEditModePrompt({
+            prompt: enhancedPrompt,
+            fileReferences,
+            action: 'chat',
+        });
+        let fullResponse = '';
+        try {
+            // Query the AI model
+            fullResponse = await this.query({
+                prompt: fullPrompt,
+                action: 'chat',
+            }, onStream, (response) => {
+                fullResponse = response;
+            }, onError);
+            // Parse edit blocks from response
+            const edits = this.parseEditBlocks(fullResponse);
+            let proposal = null;
+            if (edits.length > 0) {
+                // Create a proposal for the edits
+                const summary = `${edits.length} file edit(s) proposed`;
+                proposal = this.createEditProposal(edits, summary);
+            }
+            onComplete?.(fullResponse);
+            return { response: fullResponse, proposal };
+        }
+        catch (error) {
+            if (error instanceof Error) {
+                onError?.(error);
+            }
+            throw error;
+        }
+    }
+    // Preview what an edit would look like (diff view)
+    async previewEdit(edit) {
+        const workspaceFolders = vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.workspaceFolders;
+        if (!workspaceFolders || !edit.newContent) {
+            return;
+        }
+        const workspaceRoot = workspaceFolders[0].uri.fsPath;
+        const fullPath = path__WEBPACK_IMPORTED_MODULE_2__.isAbsolute(edit.filePath)
+            ? edit.filePath
+            : path__WEBPACK_IMPORTED_MODULE_2__.join(workspaceRoot, edit.filePath);
+        if (edit.type === 'create') {
+            // For new files, just show the content in a new untitled document
+            const doc = await vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.openTextDocument({
+                content: edit.newContent,
+                language: this.getLanguageFromPath(edit.filePath),
+            });
+            await vscode__WEBPACK_IMPORTED_MODULE_0__.window.showTextDocument(doc, { preview: true });
+        }
+        else if (edit.type === 'modify') {
+            // For modifications, use VS Code's diff editor
+            const originalUri = vscode__WEBPACK_IMPORTED_MODULE_0__.Uri.file(fullPath);
+            // Create a virtual document with the new content
+            const doc = await vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.openTextDocument({
+                content: edit.newContent,
+                language: this.getLanguageFromPath(edit.filePath),
+            });
+            // Show diff between original and proposed changes
+            await vscode__WEBPACK_IMPORTED_MODULE_0__.commands.executeCommand('vscode.diff', originalUri, doc.uri, `${path__WEBPACK_IMPORTED_MODULE_2__.basename(edit.filePath)} ↔ Proposed Changes`);
+        }
     }
 }
 // Singleton instance
@@ -29646,6 +31139,13 @@ function resetAIService() {
 
 /***/ }),
 /* 107 */
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("path");
+
+/***/ }),
+/* 108 */
 /***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
 
 "use strict";
@@ -29788,7 +31288,7 @@ class CollaborativeEditingProvider {
 
 
 /***/ }),
-/* 108 */
+/* 109 */
 /***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
 
 "use strict";
@@ -29987,7 +31487,7 @@ class CursorDecorationProvider {
 
 
 /***/ }),
-/* 109 */
+/* 110 */
 /***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
 
 "use strict";
@@ -30001,8 +31501,8 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var _services_YjsService__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(74);
 /* harmony import */ var _services_WebRTCService__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(73);
 /* harmony import */ var _services_SessionService__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(3);
-/* harmony import */ var _services_MediaCaptureServer__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(110);
-/* harmony import */ var _services_VoiceCommentStorage__WEBPACK_IMPORTED_MODULE_6__ = __webpack_require__(111);
+/* harmony import */ var _services_MediaCaptureServer__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(111);
+/* harmony import */ var _services_VoiceCommentStorage__WEBPACK_IMPORTED_MODULE_6__ = __webpack_require__(112);
 
 
 
@@ -30322,7 +31822,7 @@ class VoiceCommentProvider {
 
 
 /***/ }),
-/* 110 */
+/* 111 */
 /***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
 
 "use strict";
@@ -30886,7 +32386,7 @@ function resetMediaCaptureServer() {
 
 
 /***/ }),
-/* 111 */
+/* 112 */
 /***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
 
 "use strict";
@@ -30898,7 +32398,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */ });
 /* harmony import */ var vscode__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(1);
 /* harmony import */ var vscode__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(vscode__WEBPACK_IMPORTED_MODULE_0__);
-/* harmony import */ var path__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(112);
+/* harmony import */ var path__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(107);
 /* harmony import */ var path__WEBPACK_IMPORTED_MODULE_1___default = /*#__PURE__*/__webpack_require__.n(path__WEBPACK_IMPORTED_MODULE_1__);
 /* harmony import */ var fs__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(13);
 /* harmony import */ var fs__WEBPACK_IMPORTED_MODULE_2___default = /*#__PURE__*/__webpack_require__.n(fs__WEBPACK_IMPORTED_MODULE_2__);
@@ -31201,13 +32701,6 @@ function resetVoiceCommentStorage() {
 
 
 /***/ }),
-/* 112 */
-/***/ ((module) => {
-
-"use strict";
-module.exports = require("path");
-
-/***/ }),
 /* 113 */
 /***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
 
@@ -31218,8 +32711,14 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */ });
 /* harmony import */ var vscode__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(1);
 /* harmony import */ var vscode__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(vscode__WEBPACK_IMPORTED_MODULE_0__);
-/* harmony import */ var _services_WebRTCService__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(73);
-/* harmony import */ var _services_SessionService__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(3);
+/* harmony import */ var path__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(107);
+/* harmony import */ var path__WEBPACK_IMPORTED_MODULE_1___default = /*#__PURE__*/__webpack_require__.n(path__WEBPACK_IMPORTED_MODULE_1__);
+/* harmony import */ var child_process__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(15);
+/* harmony import */ var child_process__WEBPACK_IMPORTED_MODULE_2___default = /*#__PURE__*/__webpack_require__.n(child_process__WEBPACK_IMPORTED_MODULE_2__);
+/* harmony import */ var _services_WebRTCService__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(73);
+/* harmony import */ var _services_SessionService__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(3);
+
+
 
 
 
@@ -31231,10 +32730,20 @@ class SharedTerminalProvider {
     isSharing = false;
     writeEmitter;
     disposables = [];
+    currentCommand = '';
+    workingDirectory;
+    isExecuting = false;
+    commandHistory = [];
+    historyIndex = -1;
     constructor(context) {
-        this.webRTCService = (0,_services_WebRTCService__WEBPACK_IMPORTED_MODULE_1__.getWebRTCService)();
-        this.sessionService = (0,_services_SessionService__WEBPACK_IMPORTED_MODULE_2__.getSessionService)(context);
+        this.webRTCService = (0,_services_WebRTCService__WEBPACK_IMPORTED_MODULE_3__.getWebRTCService)();
+        this.sessionService = (0,_services_SessionService__WEBPACK_IMPORTED_MODULE_4__.getSessionService)(context);
         this.writeEmitter = new vscode__WEBPACK_IMPORTED_MODULE_0__.EventEmitter();
+        // Initialize working directory to the first workspace folder
+        const workspaceFolders = vscode__WEBPACK_IMPORTED_MODULE_0__.workspace.workspaceFolders;
+        this.workingDirectory = workspaceFolders && workspaceFolders.length > 0
+            ? workspaceFolders[0].uri.fsPath
+            : process.cwd();
         this.setupWebRTCHandlers();
     }
     setupWebRTCHandlers() {
@@ -31266,9 +32775,14 @@ class SharedTerminalProvider {
         const pty = {
             onDidWrite: this.writeEmitter.event,
             open: () => {
+                const userName = localUser?.name || 'Unknown User';
                 this.writeEmitter.fire('\x1b[32mCodeCollab Shared Terminal\x1b[0m\r\n');
+                this.writeEmitter.fire(`\x1b[33mUser: ${userName}\x1b[0m\r\n`);
                 this.writeEmitter.fire('Commands executed here are visible to all participants.\r\n');
+                this.writeEmitter.fire(`\x1b[36mWorking Directory: ${this.workingDirectory}\x1b[0m\r\n`);
+                this.writeEmitter.fire('Type "help" for available commands or start typing shell commands.\r\n');
                 this.writeEmitter.fire('---\r\n');
+                this.showPrompt();
             },
             close: () => {
                 this.stopSharing();
@@ -31286,9 +32800,14 @@ class SharedTerminalProvider {
         // Notify peers that terminal sharing started
         this.webRTCService.broadcast({
             type: 'terminal-sharing-started',
-            payload: { userId: localUser.id, userName: localUser.name },
+            payload: {
+                userId: localUser.id,
+                userName: localUser.name,
+                workingDirectory: this.workingDirectory,
+                timestamp: Date.now(),
+            },
         });
-        vscode__WEBPACK_IMPORTED_MODULE_0__.window.showInformationMessage('Terminal sharing started');
+        vscode__WEBPACK_IMPORTED_MODULE_0__.window.showInformationMessage(`Terminal sharing started by ${localUser.name}`);
         return this.sharedTerminal;
     }
     stopSharing() {
@@ -31307,64 +32826,285 @@ class SharedTerminalProvider {
         }
     }
     handleLocalInput(data) {
-        if (!this.isSharing) {
+        if (!this.isSharing || this.isExecuting) {
             return;
         }
         const localUser = this.sessionService.getLocalUser();
         if (!localUser) {
             return;
         }
-        // Echo input locally
+        // Handle different input types
         if (data === '\r') {
+            // Enter key - execute command
             this.writeEmitter.fire('\r\n');
-        }
-        else if (data === '\x7f') {
-            // Backspace
-            this.writeEmitter.fire('\b \b');
-        }
-        else {
-            this.writeEmitter.fire(data);
-        }
-        // Create terminal message
-        const message = {
-            type: 'input',
-            data,
-            timestamp: Date.now(),
-            userId: localUser.id,
-        };
-        this.terminalHistory.push(message);
-        // Broadcast to peers
-        this.webRTCService.broadcast({
-            type: 'terminal-input',
-            payload: message,
-        });
-        // Execute command when Enter is pressed
-        if (data === '\r') {
+            // Add to history if not empty and different from last command
+            if (this.currentCommand.trim() &&
+                this.commandHistory[this.commandHistory.length - 1] !== this.currentCommand) {
+                this.commandHistory.push(this.currentCommand);
+            }
+            this.historyIndex = -1;
+            // Create terminal message for input with username
+            const inputPrefix = `\x1b[33m[${localUser.name}]\x1b[0m `;
+            const message = {
+                type: 'input',
+                data: inputPrefix + this.currentCommand + '\r\n',
+                timestamp: Date.now(),
+                userId: localUser.id,
+            };
+            this.terminalHistory.push(message);
+            // Broadcast the command to peers with username
+            this.webRTCService.broadcast({
+                type: 'terminal-input',
+                payload: message,
+            });
             this.executeCommand();
         }
+        else if (data === '\x7f' || data === '\x08') {
+            // Backspace or delete
+            if (this.currentCommand.length > 0) {
+                this.currentCommand = this.currentCommand.slice(0, -1);
+                this.writeEmitter.fire('\b \b');
+            }
+        }
+        else if (data === '\x03') {
+            // Ctrl+C - terminate current process (if any)
+            this.writeEmitter.fire('^C\r\n');
+            this.showPrompt();
+            this.currentCommand = '';
+        }
+        else if (data === '\x1b[A' || data.includes('\x1b[A')) {
+            // Arrow up - show previous command
+            this.showPreviousCommand();
+        }
+        else if (data === '\x1b[B' || data.includes('\x1b[B')) {
+            // Arrow down - show next command
+            this.showNextCommand();
+        }
+        else if (data.charCodeAt(0) >= 32 && data.charCodeAt(0) <= 126) {
+            // Regular printable character
+            this.currentCommand += data;
+            this.writeEmitter.fire(data);
+            this.historyIndex = -1; // Reset history when typing new command
+        }
+        else if (data === '\t') {
+            // Tab key - simple tab completion or just insert spaces
+            const spaces = '  ';
+            this.currentCommand += spaces;
+            this.writeEmitter.fire(spaces);
+        }
     }
-    currentCommand = '';
     executeCommand() {
-        // In a real implementation, you would execute the command
-        // For security, this is simplified to just echo back
-        // Full implementation would use node-pty or similar
-        // Simulate command execution
-        const output = `\x1b[33m[Executed by ${this.sessionService.getLocalUser()?.name}]\x1b[0m\r\n`;
-        this.writeEmitter.fire(output);
+        const command = this.currentCommand.trim();
+        if (!command) {
+            this.showPrompt();
+            return;
+        }
+        // Handle built-in commands
+        if (command === 'help') {
+            this.showHelpMessage();
+            this.showPrompt();
+            this.currentCommand = '';
+            return;
+        }
+        if (command.startsWith('cd ')) {
+            this.handleCdCommand(command);
+            this.showPrompt();
+            this.currentCommand = '';
+            return;
+        }
+        if (command === 'pwd') {
+            const pwdOutput = `${this.workingDirectory}\r\n`;
+            this.writeEmitter.fire(pwdOutput);
+            this.broadcastOutput(pwdOutput);
+            this.showPrompt();
+            this.currentCommand = '';
+            return;
+        }
+        if (command === 'clear') {
+            this.writeEmitter.fire('\x1b[2J\x1b[0f');
+            this.showPrompt();
+            this.currentCommand = '';
+            return;
+        }
+        // Execute real shell command
+        this.isExecuting = true;
+        this.executeShellCommand(command);
+    }
+    executeShellCommand(command) {
+        const localUser = this.sessionService.getLocalUser();
+        if (!localUser) {
+            return;
+        }
+        // Determine shell based on platform
+        const isWindows = process.platform === 'win32';
+        const shell = isWindows ? 'cmd.exe' : '/bin/bash';
+        const shellArgs = isWindows ? ['/c', command] : ['-c', command];
+        try {
+            const process = (0,child_process__WEBPACK_IMPORTED_MODULE_2__.spawn)(shell, shellArgs, {
+                cwd: this.workingDirectory,
+                shell: true,
+            });
+            // Collect output
+            let output = '';
+            process.stdout?.on('data', (data) => {
+                const chunk = data.toString();
+                output += chunk;
+                this.writeEmitter.fire(chunk);
+            });
+            process.stderr?.on('data', (data) => {
+                const chunk = data.toString();
+                output += chunk;
+                // Display stderr in red
+                this.writeEmitter.fire(`\x1b[31m${chunk}\x1b[0m`);
+            });
+            process.on('close', (code) => {
+                this.isExecuting = false;
+                // Broadcast the output to peers
+                if (output) {
+                    this.broadcastOutput(output);
+                }
+                // Show exit code if non-zero
+                if (code !== 0) {
+                    const exitMsg = `\x1b[33mProcess exited with code ${code}\x1b[0m\r\n`;
+                    this.writeEmitter.fire(exitMsg);
+                    this.broadcastOutput(exitMsg);
+                }
+                this.showPrompt();
+                this.currentCommand = '';
+            });
+            process.on('error', (err) => {
+                this.isExecuting = false;
+                const errorMsg = `\x1b[31mError executing command: ${err.message}\x1b[0m\r\n`;
+                this.writeEmitter.fire(errorMsg);
+                this.broadcastOutput(errorMsg);
+                this.showPrompt();
+                this.currentCommand = '';
+            });
+        }
+        catch (err) {
+            this.isExecuting = false;
+            const errorMsg = `\x1b[31mFailed to execute command: ${err instanceof Error ? err.message : 'Unknown error'}\x1b[0m\r\n`;
+            this.writeEmitter.fire(errorMsg);
+            this.broadcastOutput(errorMsg);
+            this.showPrompt();
+            this.currentCommand = '';
+        }
+    }
+    handleCdCommand(command) {
+        const targetDir = command.substring(3).trim();
+        if (!targetDir) {
+            // cd without arguments goes to home directory
+            this.workingDirectory = process.env.HOME || process.cwd();
+            return;
+        }
+        // Handle absolute and relative paths
+        const resolvedPath = path__WEBPACK_IMPORTED_MODULE_1__.isAbsolute(targetDir)
+            ? targetDir
+            : path__WEBPACK_IMPORTED_MODULE_1__.join(this.workingDirectory, targetDir);
+        try {
+            // Validate directory exists by checking if it's accessible
+            const fs = __webpack_require__(13);
+            const stats = fs.statSync(resolvedPath);
+            if (stats.isDirectory()) {
+                this.workingDirectory = resolvedPath;
+                const cdOutput = `\x1b[36mChanged directory to: ${this.workingDirectory}\x1b[0m\r\n`;
+                this.writeEmitter.fire(cdOutput);
+                this.broadcastOutput(cdOutput);
+            }
+            else {
+                const errorMsg = `\x1b[31mNot a directory: ${targetDir}\x1b[0m\r\n`;
+                this.writeEmitter.fire(errorMsg);
+                this.broadcastOutput(errorMsg);
+            }
+        }
+        catch (err) {
+            const errorMsg = `\x1b[31mNo such directory: ${targetDir}\x1b[0m\r\n`;
+            this.writeEmitter.fire(errorMsg);
+            this.broadcastOutput(errorMsg);
+        }
+    }
+    showHelpMessage() {
+        const localUser = this.sessionService.getLocalUser();
+        const userName = localUser?.name || 'user';
+        const help = `
+\x1b[32mCodeCollab Terminal Commands (${userName}):\x1b[0m
+  pwd                - Print working directory
+  cd <path>          - Change directory
+  clear              - Clear terminal screen
+  help               - Show this help message
+
+Any other command will be executed in the shell.
+Examples: npm install, node script.js, python app.py, npm test, etc.
+\r\n`;
+        this.writeEmitter.fire(help);
+        this.broadcastOutput(help);
+    }
+    showPrompt() {
+        const localUser = this.sessionService.getLocalUser();
+        const userName = localUser?.name || 'user';
+        const prompt = `\x1b[36m${userName}@${this.workingDirectory}$\x1b[0m `;
+        this.writeEmitter.fire(prompt);
+    }
+    broadcastOutput(output) {
+        const localUser = this.sessionService.getLocalUser();
+        if (!localUser) {
+            return;
+        }
+        // Add username prefix to output for clarity in multi-user scenario
+        const userPrefix = `\x1b[33m[${localUser.name}]\x1b[0m `;
+        const enrichedOutput = userPrefix + output;
         const message = {
             type: 'output',
-            data: output,
+            data: enrichedOutput,
             timestamp: Date.now(),
-            userId: this.sessionService.getLocalUser()?.id || '',
+            userId: localUser.id,
         };
         this.terminalHistory.push(message);
         this.webRTCService.broadcast({
             type: 'terminal-output',
             payload: message,
         });
-        // Show prompt
-        this.writeEmitter.fire('$ ');
-        this.currentCommand = '';
+    }
+    showPreviousCommand() {
+        if (this.commandHistory.length === 0) {
+            return;
+        }
+        if (this.historyIndex === -1) {
+            this.historyIndex = this.commandHistory.length - 1;
+        }
+        else if (this.historyIndex > 0) {
+            this.historyIndex--;
+        }
+        else {
+            return; // Already at the beginning
+        }
+        this.replaceCurrentCommand(this.commandHistory[this.historyIndex]);
+    }
+    showNextCommand() {
+        if (this.commandHistory.length === 0) {
+            return;
+        }
+        if (this.historyIndex === -1) {
+            return; // Nothing to go forward to
+        }
+        if (this.historyIndex < this.commandHistory.length - 1) {
+            this.historyIndex++;
+            this.replaceCurrentCommand(this.commandHistory[this.historyIndex]);
+        }
+        else {
+            this.historyIndex = -1;
+            this.replaceCurrentCommand('');
+        }
+    }
+    replaceCurrentCommand(newCommand) {
+        // Clear the current command from display
+        for (let i = 0; i < this.currentCommand.length; i++) {
+            this.writeEmitter.fire('\b \b');
+        }
+        // Set new command
+        this.currentCommand = newCommand;
+        // Display new command
+        this.writeEmitter.fire(newCommand);
     }
     handleRemoteTerminalOutput(message) {
         this.terminalHistory.push(message);
@@ -31840,8 +33580,8 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var _YjsService__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(74);
 /* harmony import */ var _AIService__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(106);
 /* harmony import */ var _SessionService__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(3);
-/* harmony import */ var _MediaCaptureServer__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(110);
-/* harmony import */ var _VoiceCommentStorage__WEBPACK_IMPORTED_MODULE_6__ = __webpack_require__(111);
+/* harmony import */ var _MediaCaptureServer__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(111);
+/* harmony import */ var _VoiceCommentStorage__WEBPACK_IMPORTED_MODULE_6__ = __webpack_require__(112);
 
 
 
@@ -31962,9 +33702,9 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var vscode__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(1);
 /* harmony import */ var vscode__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(vscode__WEBPACK_IMPORTED_MODULE_0__);
 /* harmony import */ var _panels_CollabPanel__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(2);
-/* harmony import */ var _providers_CollaborativeEditingProvider__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(107);
-/* harmony import */ var _providers_CursorDecorationProvider__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(108);
-/* harmony import */ var _providers_VoiceCommentProvider__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(109);
+/* harmony import */ var _providers_CollaborativeEditingProvider__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(108);
+/* harmony import */ var _providers_CursorDecorationProvider__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(109);
+/* harmony import */ var _providers_VoiceCommentProvider__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(110);
 /* harmony import */ var _providers_SharedTerminalProvider__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(113);
 /* harmony import */ var _commands__WEBPACK_IMPORTED_MODULE_6__ = __webpack_require__(114);
 /* harmony import */ var _services__WEBPACK_IMPORTED_MODULE_7__ = __webpack_require__(115);

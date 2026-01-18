@@ -121,7 +121,25 @@
         "codecollab.ollamaUrl": {
           "type": "string",
           "default": "http://localhost:11434",
-          "description": "Ollama API URL for AI features"
+          "description": "Ollama API URL for AI features (CodeLlama offline mode)"
+        },
+        "codecollab.geminiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Google Gemini API key for online AI assistance. Get your free API key at https://aistudio.google.com/apikey"
+        },
+        "codecollab.defaultAIModel": {
+          "type": "string",
+          "default": "gemini",
+          "enum": [
+            "gemini",
+            "codellama"
+          ],
+          "enumDescriptions": [
+            "Gemini (Online) - Better & Quick Responses - Requires API key",
+            "CodeLlama 7B (Offline) - Local Processing - Requires Ollama installed"
+          ],
+          "description": "Default AI model for code assistance"
         },
         "codecollab.defaultModel": {
           "type": "string",
@@ -133,7 +151,7 @@
             "mistral:7b",
             "llama2:7b"
           ],
-          "description": "Default Ollama model for AI assistance"
+          "description": "Ollama model variant (only used when CodeLlama offline mode is selected)"
         },
         "codecollab.enableVideo": {
           "type": "boolean",
